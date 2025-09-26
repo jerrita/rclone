@@ -35,7 +35,7 @@ const (
 
 // Globals
 var (
-	preRefreshDuration = 5 * time.Minute
+	preRefreshDuration = 7 * 24 * time.Hour
 
 	apiUserInfo      = Api{"/api/v1/user/info", "", rate.NewLimiter(rate.Limit(1), 1)}
 	apiAccessToken   = Api{"/api/v1/access_token", "POST", rate.NewLimiter(rate.Limit(1), 1)}
@@ -290,7 +290,6 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	srv.SetHeader("Platform", "open_platform")
 	srv.SetHeader("Content-Type", "application/json")
 
-	// TODO: use error handler to process reauth
 	f := &Fs{
 		name: name,
 		root: root,
@@ -438,19 +437,19 @@ func (f *Fs) NewObjectComplete(ctx context.Context, remote string, cf api.Comple
 }
 
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
-	panic("not implemented")
+	panic("not implemented yet")
 }
 
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	panic("not implemented")
+	panic("not implemented yet")
 }
 
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
-	panic("not implemented")
+	panic("not implemented yet")
 }
 
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
-	panic("not implemented")
+	panic("not implemented yet")
 }
 
 func toString(x int64) string {
