@@ -42,6 +42,7 @@ var (
 	apiFileMove      = Api{"/api/v1/file/move", "", rate.NewLimiter(rate.Limit(1), 1)}
 	apiFileDelete    = Api{"/api/v1/file/delete", "", rate.NewLimiter(rate.Limit(1), 1)}
 	apiFileList      = Api{"/api/v1/file/list", "GET", rate.NewLimiter(rate.Limit(4), 4)}
+	apiFileDetail    = Api{"/api/v1/file/detail", "GET", rate.NewLimiter(rate.Limit(4), 4)}
 	apiFileInfoMulti = Api{"/api/v1/file/infos", "POST", rate.NewLimiter(rate.Limit(10), 10)}
 	apiFileDownload  = Api{"/api/v1/file/download_info", "GET", rate.NewLimiter(rate.Limit(5), 5)}
 	apiMkdir         = Api{"/upload/v1/file/mkdir", "", rate.NewLimiter(rate.Limit(2), 2)}
@@ -272,9 +273,24 @@ func parsePath(path string) (root string) {
 	return
 }
 
+// FindLeaf finds a directory of name leaf in the folder with ID pathID
 func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut string, found bool, err error) {
-	//TODO implement me
-	panic("implement me")
+	files, err := f.listAll(ctx, toId(pathID))
+	if err != nil {
+		fs.Debugf(f, "listAll: %v", err)
+		return "", false, err
+	}
+
+	for _, file := range files {
+		if file.Type == api.TypeFile {
+			continue
+		}
+		if strings.EqualFold(file.FileName, leaf) {
+			return toString(file.FileId), true, nil
+		}
+	}
+
+	return pathIDOut, false, nil
 }
 
 func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, err error) {
@@ -344,6 +360,32 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	rootId := f.opt.RootId
 	f.dirCache = dircache.New(root, toString(rootId), f)
+
+	err = f.dirCache.FindRoot(ctx, false)
+	if err != nil {
+		// Assume it is a file
+		newRoot, _ := dircache.SplitPath(root)
+		tempF := *f
+		tempF.dirCache = dircache.New(newRoot, toString(rootId), &tempF)
+		tempF.root = newRoot
+		// Make new Fs which is the parent
+		err = tempF.dirCache.FindRoot(ctx, false)
+		if err != nil {
+			// No root so return old f
+			return f, nil
+		}
+
+		f.features.Fill(ctx, &tempF)
+		// XXX: update the old f here instead of returning tempF, since
+		// `features` were already filled with functions having *f as a receiver.
+		// See https://github.com/rclone/rclone/issues/2182
+		f.dirCache = tempF.dirCache
+		f.root = tempF.root
+
+		// return an error with a fs which points to the parent
+		return f, fs.ErrorIsFile
+	}
+
 	return f, nil
 }
 
@@ -372,8 +414,6 @@ func (f *Fs) listAll(ctx context.Context, dirId int64) ([]api.CompleteFile, erro
 	respMeta := api.Response[api.GetFileInfoMultiResponse]{}
 
 	for {
-		fileMap := make(map[int64]api.File)
-
 		_ = apiFileList.limiter.Wait(ctx)
 		_, err := f.srv.CallJSON(ctx, &optsFile, &requestFile, &respFile)
 		if err != nil {
@@ -385,7 +425,6 @@ func (f *Fs) listAll(ctx context.Context, dirId int64) ([]api.CompleteFile, erro
 
 		requestMeta.Fields = make([]int64, 0)
 		for _, file := range respFile.Data.FileList {
-			fileMap[file.FileId] = file
 			requestMeta.Fields = append(requestMeta.Fields, file.FileId)
 		}
 
@@ -393,11 +432,18 @@ func (f *Fs) listAll(ctx context.Context, dirId int64) ([]api.CompleteFile, erro
 		_, err = f.srv.CallJSON(ctx, &optsMeta, &requestMeta, &respMeta)
 
 		for _, meta := range respMeta.Data.FileList {
-			cf := api.CompleteFile{}
-			if file, ok := fileMap[meta.FileId]; ok {
-				cf.File = file
+			cf := api.CompleteFile{
+				FileId:       meta.FileId,
+				FileName:     meta.FileName,
+				ParentFileId: meta.ParentFileId,
+				Type:         meta.Type,
+				MD5:          meta.MD5,
+				Size:         meta.Size,
+				Status:       meta.Status,
+				Trashed:      meta.Trashed,
+				CreateAt:     meta.CreateAt,
+				UpdateAt:     meta.UpdateAt,
 			}
-			cf.Meta = meta
 			files = append(files, cf)
 		}
 
@@ -412,24 +458,26 @@ func (f *Fs) listAll(ctx context.Context, dirId int64) ([]api.CompleteFile, erro
 }
 
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
-	if dir != "" {
-		return nil, errors.New("only root directories can be listed now")
+	fs.Debugf(nil, "list called with dir: %s", dir)
+	directoryID, err := f.dirCache.FindDir(ctx, dir, false)
+	if err != nil {
+		return nil, err
 	}
 
-	list, err := f.listAll(ctx, f.opt.RootId)
-	for _, cf := range list {
-		remote := path.Join(dir, cf.File.FileName)
-		if cf.File.Type == api.TypeFolder {
-			f.dirCache.Put(remote, toString(cf.File.FileId))
+	list, err := f.listAll(ctx, toId(directoryID))
+	for _, file := range list {
+		remote := path.Join(dir, file.FileName)
+		if file.Type == api.TypeFolder {
+			f.dirCache.Put(remote, toString(file.FileId))
 			loc, _ := time.LoadLocation("Local")
-			modTime, err := time.ParseInLocation(timeMetaLayout, cf.Meta.UpdateAt, loc)
+			modTime, err := time.ParseInLocation(timeMetaLayout, file.UpdateAt, loc)
 			if err != nil {
 				return nil, err
 			}
-			d := fs.NewDir(remote, modTime).SetID(toString(cf.File.FileId)).SetParentID(toString(f.opt.RootId))
+			d := fs.NewDir(remote, modTime).SetID(toString(file.FileId)).SetParentID(toString(f.opt.RootId))
 			entries = append(entries, d)
 		} else {
-			o, err := f.NewObjectComplete(ctx, remote, cf)
+			o, err := f.NewObjectComplete(ctx, remote, file)
 			if err == nil {
 				entries = append(entries, o)
 			} else {
@@ -441,9 +489,9 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	return entries, err
 }
 
-func (f *Fs) NewObjectComplete(ctx context.Context, remote string, cf api.CompleteFile) (fs.Object, error) {
+func (f *Fs) NewObjectComplete(ctx context.Context, remote string, file api.CompleteFile) (fs.Object, error) {
 	loc, _ := time.LoadLocation("Local")
-	modTime, err := time.ParseInLocation(timeMetaLayout, cf.Meta.UpdateAt, loc)
+	modTime, err := time.ParseInLocation(timeMetaLayout, file.UpdateAt, loc)
 	if err != nil {
 		return nil, err
 	}
@@ -451,17 +499,21 @@ func (f *Fs) NewObjectComplete(ctx context.Context, remote string, cf api.Comple
 	o := &Object{
 		fs:      f,
 		remote:  remote,
-		size:    cf.File.Size,
+		size:    file.Size,
 		modTime: modTime,
-		id:      toString(cf.File.FileId),
-		md5:     cf.File.MD5,
+		id:      toString(file.FileId),
+		md5:     file.MD5,
 	}
 
 	return o, nil
 }
 
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
-	panic("not implemented yet")
+	o := &Object{
+		fs:     f,
+		remote: remote,
+	}
+	return o, nil
 }
 
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {

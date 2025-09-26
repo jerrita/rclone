@@ -36,6 +36,22 @@ type GetFileListResponse struct {
 	FileList []File `json:"fileList"`
 }
 
+type GetFileDetail struct {
+	FileId int64 `json:"fileID"`
+}
+
+type GetFileDetailResponse struct {
+	FileId       int64  `json:"fileID"`       // 文件ID
+	FileName     string `json:"filename"`     // 文件名
+	Type         int    `json:"type"`         // 0-file 1-folder
+	Size         int64  `json:"size"`         // 大小
+	MD5          string `json:"etag"`         // MD5 (ETag)
+	Status       int    `json:"status"`       // 文件审核状态。 大于 100 为审核驳回文件
+	ParentFileId int64  `json:"parentFileId"` // 目录ID
+	CreateAt     string `json:"createAt"`     // 创建时间
+	Trashed      int    `json:"trashed"`      // 是否在回收站
+}
+
 type GetFileInfoMulti struct {
 	Fields []int64 `json:"fileIds"` // 文件ID数组
 }
@@ -83,8 +99,16 @@ type FileInfo struct {
 }
 
 type CompleteFile struct {
-	File File
-	Meta FileInfo
+	FileId       int64  // 文件ID
+	FileName     string // 文件名
+	ParentFileId int64  // 目录ID
+	Type         int    // 0-file 1-folder
+	MD5          string // MD5 (ETag)
+	Size         int64  // 大小
+	Status       int    // 文件审核状态。 大于 100 为审核驳回文件
+	Trashed      int    // 是否在回收站
+	CreateAt     string // 创建时间
+	UpdateAt     string // 更新时间
 }
 
 const (
