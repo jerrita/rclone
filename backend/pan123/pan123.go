@@ -36,6 +36,7 @@ const (
 // Globals
 var (
 	preRefreshDuration = 7 * 24 * time.Hour
+	fileMetaCache      = map[string]api.CompleteFile{}
 
 	apiUserInfo      = Api{"/api/v1/user/info", "", rate.NewLimiter(rate.Limit(1), 1)}
 	apiAccessToken   = Api{"/api/v1/access_token", "POST", rate.NewLimiter(rate.Limit(1), 1)}
@@ -193,10 +194,6 @@ func (o *Object) SetModTime(ctx context.Context, t time.Time) error {
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
 	fs.FixRangeOption(options, o.size)
 
-	if o.id == "" {
-		return nil, errors.New("open object: can't download - no id")
-	}
-
 	opts := rest.Opts{
 		Method: apiFileDownload.method,
 		Path:   apiFileDownload.uri,
@@ -265,12 +262,6 @@ func (f *Fs) Precision() time.Duration {
 // Hashes Returns the supported hash types of the filesystem
 func (f *Fs) Hashes() hash.Set {
 	return hash.Set(hash.MD5)
-}
-
-// parsePath parses a box 'url'
-func parsePath(path string) (root string) {
-	root = strings.Trim(path, "/")
-	return
 }
 
 // FindLeaf finds a directory of name leaf in the folder with ID pathID
@@ -430,6 +421,12 @@ func (f *Fs) listAll(ctx context.Context, dirId int64) ([]api.CompleteFile, erro
 
 		_ = apiFileInfoMulti.limiter.Wait(ctx)
 		_, err = f.srv.CallJSON(ctx, &optsMeta, &requestMeta, &respMeta)
+		if err != nil {
+			return nil, err
+		}
+		if respMeta.Code != 0 {
+			return nil, fmt.Errorf("failed to list file meta: %d (%s)", respMeta.Code, respMeta.Message)
+		}
 
 		for _, meta := range respMeta.Data.FileList {
 			cf := api.CompleteFile{
@@ -478,6 +475,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 			entries = append(entries, d)
 		} else {
 			o, err := f.NewObjectComplete(ctx, remote, file)
+			fileMetaCache[remote] = file
 			if err == nil {
 				entries = append(entries, o)
 			} else {
@@ -513,7 +511,37 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 		fs:     f,
 		remote: remote,
 	}
-	return o, nil
+
+	root, leaf := dircache.SplitPath(remote)
+	_, err := f.dirCache.FindDir(ctx, root, false)
+	if err != nil {
+		if err == fs.ErrorDirNotFound {
+			return nil, fs.ErrorObjectNotFound
+		}
+		return nil, err
+	}
+
+	if fileMetaCache[leaf].FileId == 0 {
+		// no cache, refresh
+		_, err := f.List(ctx, root)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if fileMetaCache[leaf].FileId == 0 {
+		return nil, fs.ErrorObjectNotFound
+	}
+
+	cache := fileMetaCache[leaf]
+	o.id = toString(cache.FileId)
+	o.md5 = cache.MD5
+	o.size = cache.Size
+
+	loc, _ := time.LoadLocation("Local")
+	modTime, err := time.ParseInLocation(timeMetaLayout, cache.UpdateAt, loc)
+	o.modTime = modTime
+	return o, err
 }
 
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
