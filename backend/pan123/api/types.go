@@ -44,6 +44,14 @@ type GetFileInfoMultiResponse struct {
 	FileList []FileInfo `json:"fileList"`
 }
 
+type GetDownloadInfo struct {
+	FileId int64 `json:"fileId"`
+}
+
+type GetDownloadInfoResponse struct {
+	DownloadUrl string `json:"downloadUrl"`
+}
+
 type File struct {
 	FileId       int64  `json:"fileID"`       // 文件ID
 	FileName     string `json:"fileName"`     // 文件名

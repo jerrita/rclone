@@ -42,7 +42,8 @@ var (
 	apiFileMove      = Api{"/api/v1/file/move", "", rate.NewLimiter(rate.Limit(1), 1)}
 	apiFileDelete    = Api{"/api/v1/file/delete", "", rate.NewLimiter(rate.Limit(1), 1)}
 	apiFileList      = Api{"/api/v1/file/list", "GET", rate.NewLimiter(rate.Limit(4), 4)}
-	apiFileInfoMulti = Api{"/api/v1/file/infos", "POST", rate.NewLimiter(rate.Limit(4), 4)}
+	apiFileInfoMulti = Api{"/api/v1/file/infos", "POST", rate.NewLimiter(rate.Limit(10), 10)}
+	apiFileDownload  = Api{"/api/v1/file/download_info", "GET", rate.NewLimiter(rate.Limit(5), 5)}
 	apiMkdir         = Api{"/upload/v1/file/mkdir", "", rate.NewLimiter(rate.Limit(2), 2)}
 	apiFileCreate    = Api{"/upload/v1/file/create", "", rate.NewLimiter(rate.Limit(2), 2)}
 )
@@ -128,6 +129,7 @@ type Fs struct {
 	opt      Options            // parsed options
 	features *fs.Features       // optional features
 	srv      *rest.Client       // the connection to the server
+	curl     *rest.Client       // for download
 	dirCache *dircache.DirCache // Map of directory path to directory id
 	m        configmap.Mapper   // configmap.Mapper
 }
@@ -188,8 +190,38 @@ func (o *Object) SetModTime(ctx context.Context, t time.Time) error {
 }
 
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
-	//TODO implement me
-	panic("implement me")
+	fs.FixRangeOption(options, o.size)
+
+	if o.id == "" {
+		return nil, errors.New("open object: can't download - no id")
+	}
+
+	opts := rest.Opts{
+		Method: apiFileDownload.method,
+		Path:   apiFileDownload.uri,
+	}
+	request := api.GetDownloadInfo{FileId: toId(o.id)}
+	resp := api.Response[api.GetDownloadInfoResponse]{}
+
+	_ = apiFileDownload.limiter.Wait(ctx)
+	_, err := o.fs.srv.CallJSON(ctx, &opts, &request, &resp)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.Code != 0 {
+		return nil, fmt.Errorf("failed to download: %d (%s)", resp.Code, resp.Message)
+	}
+
+	fs.Debugf(o, "download url: %s (%s) => %s", o.remote, o.id, resp.Data.DownloadUrl)
+	opts.RootURL = resp.Data.DownloadUrl
+	opts.Path = ""
+	opts.Method = "GET"
+	d, err := o.fs.curl.Call(ctx, &opts)
+	if err != nil {
+		return nil, err
+	}
+	return d.Body, err
 }
 
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
@@ -295,6 +327,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		root: root,
 		opt:  *opt,
 		srv:  srv,
+		curl: rest.NewClient(client),
 		m:    m,
 	}
 
@@ -378,15 +411,6 @@ func (f *Fs) listAll(ctx context.Context, dirId int64) ([]api.CompleteFile, erro
 	return files, nil
 }
 
-// List the objects and directories in dir into entries.  The
-// entries can be returned in any order but should be for a
-// complete directory.
-//
-// dir should be "" to list the root, and should not have
-// trailing slashes.
-//
-// This should return ErrDirNotFound if the directory isn't
-// found.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
 	if dir != "" {
 		return nil, errors.New("only root directories can be listed now")
@@ -454,4 +478,13 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 
 func toString(x int64) string {
 	return strconv.FormatInt(x, 10)
+}
+
+func toId(x string) int64 {
+	id, err := strconv.ParseInt(x, 10, 64)
+	if err != nil {
+		fs.Errorf(nil, "Failed to parse id: %v", err)
+		return 0
+	}
+	return id
 }
