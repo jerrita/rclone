@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,24 +24,27 @@ import (
 
 type Api struct {
 	uri     string
+	method  string
 	limiter *rate.Limiter
 }
 
 const (
-	rootUrl = "https://open-api.123pan.com"
+	rootUrl        = "https://open-api.123pan.com"
+	timeMetaLayout = "2006-01-02 15:04:05"
 )
 
 // Globals
 var (
-	preRefreshDuration = time.Duration(5 * time.Minute)
+	preRefreshDuration = 5 * time.Minute
 
-	apiUserInfo    = Api{"api/v1/user/info", rate.NewLimiter(rate.Limit(1), 1)}
-	apiAccessToken = Api{"api/v1/access_token", rate.NewLimiter(rate.Limit(1), 1)}
-	apiFileMove    = Api{"api/v1/file/move", rate.NewLimiter(rate.Limit(1), 1)}
-	apiFileDelete  = Api{"api/v1/file/delete", rate.NewLimiter(rate.Limit(1), 1)}
-	apiFileList    = Api{"api/v1/file/list", rate.NewLimiter(rate.Limit(4), 4)}
-	apiMkdir       = Api{"upload/v1/file/mkdir", rate.NewLimiter(rate.Limit(2), 2)}
-	apiFileCreate  = Api{"upload/v1/file/create", rate.NewLimiter(rate.Limit(2), 2)}
+	apiUserInfo      = Api{"/api/v1/user/info", "", rate.NewLimiter(rate.Limit(1), 1)}
+	apiAccessToken   = Api{"/api/v1/access_token", "POST", rate.NewLimiter(rate.Limit(1), 1)}
+	apiFileMove      = Api{"/api/v1/file/move", "", rate.NewLimiter(rate.Limit(1), 1)}
+	apiFileDelete    = Api{"/api/v1/file/delete", "", rate.NewLimiter(rate.Limit(1), 1)}
+	apiFileList      = Api{"/api/v1/file/list", "GET", rate.NewLimiter(rate.Limit(4), 4)}
+	apiFileInfoMulti = Api{"/api/v1/file/infos", "POST", rate.NewLimiter(rate.Limit(4), 4)}
+	apiMkdir         = Api{"/upload/v1/file/mkdir", "", rate.NewLimiter(rate.Limit(2), 2)}
+	apiFileCreate    = Api{"/upload/v1/file/create", "", rate.NewLimiter(rate.Limit(2), 2)}
 )
 
 // Register with Fs
@@ -59,6 +64,11 @@ func init() {
 			Required:  true,
 			Sensitive: true,
 		}, {
+			Name:     "root_id",
+			Help:     "pan123 root folder id",
+			Default:  0,
+			Required: true,
+		}, {
 			Name:     "access_token",
 			Help:     "pan123 open access_token",
 			Default:  "",
@@ -73,39 +83,42 @@ func init() {
 }
 
 func (f *Fs) authorizeAccount(ctx context.Context) error {
-	if f.opt.accessToken != "" && f.opt.expiredAt != "" {
-		parsedTime, err := time.Parse(time.RFC3339, f.opt.expiredAt)
+	if f.opt.AccessToken != "" && f.opt.ExpiredAt != "" {
+		parsedTime, err := time.Parse(time.RFC3339, f.opt.ExpiredAt)
 		if err != nil {
 			return err
 		}
 		if time.Now().Add(preRefreshDuration).Before(parsedTime) {
+			f.srv.SetHeader("Authorization", "Bearer "+f.opt.AccessToken)
 			return nil
 		}
 	}
 
 	opts := rest.Opts{
-		Method: "POST",
+		Method: apiAccessToken.method,
 		Path:   apiAccessToken.uri,
 	}
-	var request = api.GetAccessToken{
-		ClientId:     f.opt.clientId,
-		ClientSecret: f.opt.clientSecret,
+	request := api.GetAccessToken{
+		ClientId:     f.opt.ClientId,
+		ClientSecret: f.opt.ClientSecret,
 	}
 
-	apiAccessToken.limiter.Wait(ctx)
-	resp := api.ApiResponse[api.GetAccessTokenResponse]{}
+	_ = apiAccessToken.limiter.Wait(ctx)
+	resp := api.Response[api.GetAccessTokenResponse]{}
 	_, err := f.srv.CallJSON(ctx, &opts, &request, &resp)
 	if err != nil {
 		return err
 	}
 
-	if resp.Code != 200 {
-		return fmt.Errorf("failed to get access token: %s", resp.Message)
+	if resp.Code != 0 {
+		return fmt.Errorf("failed to get access token: %d (%s)", resp.Code, resp.Message)
 	}
 
 	f.srv.SetHeader("Authorization", "Bearer "+resp.Data.AccessToken)
-	f.opt.accessToken = resp.Data.AccessToken
-	f.opt.expiredAt = resp.Data.ExpiredAt
+	f.opt.AccessToken = resp.Data.AccessToken
+	f.opt.ExpiredAt = resp.Data.ExpiredAt
+	f.m.Set("access_token", resp.Data.AccessToken)
+	f.m.Set("expired_at", resp.Data.ExpiredAt)
 	return nil
 }
 
@@ -116,13 +129,77 @@ type Fs struct {
 	features *fs.Features       // optional features
 	srv      *rest.Client       // the connection to the server
 	dirCache *dircache.DirCache // Map of directory path to directory id
+	m        configmap.Mapper   // configmap.Mapper
 }
 
 type Options struct {
-	clientId     string `config:"client_id"`
-	clientSecret string `config:"client_secret"`
-	accessToken  string `config:"access_token"`
-	expiredAt    string `config:"expired_at"`
+	ClientId     string `config:"client_id"`
+	ClientSecret string `config:"client_secret"`
+	RootId       int64  `config:"root_id"`
+	AccessToken  string `config:"access_token"`
+	ExpiredAt    string `config:"expired_at"`
+}
+
+type Object struct {
+	fs      *Fs       // what this object is part of
+	remote  string    // The remote path
+	size    int64     // size of the object
+	modTime time.Time // modification time of the object
+	id      string    // ID of the object
+	md5     string    // MD5 of the object content
+}
+
+func (o *Object) Fs() fs.Info {
+	return o.fs
+}
+
+func (o *Object) String() string {
+	if o == nil {
+		return "<nil>"
+	}
+	return o.remote
+}
+
+func (o *Object) Remote() string {
+	return o.remote
+}
+
+func (o *Object) ModTime(ctx context.Context) time.Time {
+	return o.modTime
+}
+
+func (o *Object) Size() int64 {
+	return o.size
+}
+
+func (o *Object) Hash(ctx context.Context, ty hash.Type) (string, error) {
+	if ty != hash.MD5 {
+		return "", hash.ErrUnsupported
+	}
+	return o.md5, nil
+}
+
+func (o *Object) Storable() bool {
+	return true
+}
+
+func (o *Object) SetModTime(ctx context.Context, t time.Time) error {
+	return errors.New("SetModTime not supported on this backend")
+}
+
+func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (o *Object) Remove(ctx context.Context) error {
+	//TODO implement me
+	panic("implement me")
 }
 
 // ------------------------------------------------------------
@@ -152,7 +229,7 @@ func (f *Fs) Precision() time.Duration {
 	return time.Millisecond
 }
 
-// Returns the supported hash types of the filesystem
+// Hashes Returns the supported hash types of the filesystem
 func (f *Fs) Hashes() hash.Set {
 	return hash.Set(hash.MD5)
 }
@@ -163,16 +240,23 @@ func parsePath(path string) (root string) {
 	return
 }
 
+func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut string, found bool, err error) {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, err error) {
+	//TODO implement me
+	panic("implement me")
+}
+
 // errorHandler parses a non 2xx error response into an error
 func errorHandler(resp *http.Response) error {
 	// Decode error response
-	errResponse := new(api.ApiResponse[string])
+	errResponse := new(api.Response[string])
 	err := rest.DecodeJSON(resp, &errResponse)
 	if err != nil {
 		fs.Debugf(nil, "Couldn't decode error response: %v", err)
-	}
-	if errResponse.Code == 0 {
-		errResponse.Code = resp.StatusCode
 	}
 	return errResponse
 }
@@ -196,7 +280,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		return nil, err
 	}
 
-	if opt.clientId == "" || opt.clientSecret == "" {
+	if opt.ClientId == "" || opt.ClientSecret == "" {
 		return nil, errors.New("client_id and client_secret are required")
 	}
 
@@ -212,6 +296,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		root: root,
 		opt:  *opt,
 		srv:  srv,
+		m:    m,
 	}
 
 	f.features = (&fs.Features{
@@ -225,25 +310,149 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		return nil, err
 	}
 
+	rootId := f.opt.RootId
+	f.dirCache = dircache.New(root, toString(rootId), f)
 	return f, nil
 }
 
+func (f *Fs) listAll(ctx context.Context, dirId int64) ([]api.CompleteFile, error) {
+	files := make([]api.CompleteFile, 0)
+	page := 1
+
+	optsFile := rest.Opts{
+		Method: apiFileList.method,
+		Path:   apiFileList.uri,
+	}
+	optsMeta := rest.Opts{
+		Method: apiFileInfoMulti.method,
+		Path:   apiFileInfoMulti.uri,
+	}
+	requestFile := api.GetFileList{
+		ParentFileId:   dirId,
+		Page:           page,
+		Limit:          100,
+		OrderBy:        "file_name",
+		OrderDirection: "asc",
+		Trashed:        false,
+	}
+	requestMeta := api.GetFileInfoMulti{}
+	respFile := api.Response[api.GetFileListResponse]{}
+	respMeta := api.Response[api.GetFileInfoMultiResponse]{}
+
+	for {
+		fileMap := make(map[int64]api.File)
+
+		_ = apiFileList.limiter.Wait(ctx)
+		_, err := f.srv.CallJSON(ctx, &optsFile, &requestFile, &respFile)
+		if err != nil {
+			return nil, err
+		}
+		if respFile.Code != 0 {
+			return nil, fmt.Errorf("failed to list files: %d (%s)", respFile.Code, respFile.Message)
+		}
+
+		requestMeta.Fields = make([]int64, 0)
+		for _, file := range respFile.Data.FileList {
+			fileMap[file.FileId] = file
+			requestMeta.Fields = append(requestMeta.Fields, file.FileId)
+		}
+
+		_ = apiFileInfoMulti.limiter.Wait(ctx)
+		_, err = f.srv.CallJSON(ctx, &optsMeta, &requestMeta, &respMeta)
+
+		for _, meta := range respMeta.Data.FileList {
+			cf := api.CompleteFile{}
+			if file, ok := fileMap[meta.FileId]; ok {
+				cf.File = file
+			}
+			cf.Meta = meta
+			files = append(files, cf)
+		}
+
+		if len(respFile.Data.FileList) < 100 {
+			break
+		}
+		page++
+		requestFile.Page = page
+	}
+
+	return files, nil
+}
+
+// List the objects and directories in dir into entries.  The
+// entries can be returned in any order but should be for a
+// complete directory.
+//
+// dir should be "" to list the root, and should not have
+// trailing slashes.
+//
+// This should return ErrDirNotFound if the directory isn't
+// found.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
-	return nil, fs.ErrorNotImplemented
+	if dir != "" {
+		return nil, errors.New("only root directories can be listed now")
+	}
+
+	list, err := f.listAll(ctx, f.opt.RootId)
+	for _, cf := range list {
+		remote := path.Join(dir, cf.File.FileName)
+		if cf.File.Type == api.TypeFolder {
+			f.dirCache.Put(remote, toString(cf.File.FileId))
+			loc, _ := time.LoadLocation("Local")
+			modTime, err := time.ParseInLocation(timeMetaLayout, cf.Meta.UpdateAt, loc)
+			if err != nil {
+				return nil, err
+			}
+			d := fs.NewDir(remote, modTime).SetID(toString(cf.File.FileId)).SetParentID(toString(f.opt.RootId))
+			entries = append(entries, d)
+		} else {
+			o, err := f.NewObjectComplete(ctx, remote, cf)
+			if err == nil {
+				entries = append(entries, o)
+			} else {
+				fs.Debugf(nil, "Failed to list object: %v", err)
+			}
+		}
+	}
+
+	return entries, err
+}
+
+func (f *Fs) NewObjectComplete(ctx context.Context, remote string, cf api.CompleteFile) (fs.Object, error) {
+	loc, _ := time.LoadLocation("Local")
+	modTime, err := time.ParseInLocation(timeMetaLayout, cf.Meta.UpdateAt, loc)
+	if err != nil {
+		return nil, err
+	}
+
+	o := &Object{
+		fs:      f,
+		remote:  remote,
+		size:    cf.File.Size,
+		modTime: modTime,
+		id:      toString(cf.File.FileId),
+		md5:     cf.File.MD5,
+	}
+
+	return o, nil
 }
 
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
-	return nil, fs.ErrorNotImplemented
+	panic("not implemented")
 }
 
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	return nil, fs.ErrorNotImplemented
+	panic("not implemented")
 }
 
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
-	return fs.ErrorNotImplemented
+	panic("not implemented")
 }
 
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
-	return fs.ErrorNotImplemented
+	panic("not implemented")
+}
+
+func toString(x int64) string {
+	return strconv.FormatInt(x, 10)
 }
