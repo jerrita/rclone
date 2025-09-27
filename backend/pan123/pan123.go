@@ -632,9 +632,9 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 
 	// Get parent directory
 	root, leaf := dircache.SplitPath(remote)
-	parentID, err := f.dirCache.FindDir(ctx, root, false)
+	parentID, err := f.dirCache.FindDir(ctx, root, true)
 	if err != nil {
-		return nil, fmt.Errorf("failed to find parent directory: %w", err)
+		return nil, fmt.Errorf("failed to find/create parent directory: %w", err)
 	}
 
 	// Create file
