@@ -121,9 +121,7 @@ type FileTrashResponse struct {
 	// Usually empty on success, data is null
 }
 
-type GetUploadDomainsResponse struct {
-	Domains []string `json:"data"` // 上传域名列表
-}
+type GetUploadDomainsResponse = []string
 
 type SingleUploadRequest struct {
 	ParentFileID int64  `json:"parentFileID"` // 父目录ID

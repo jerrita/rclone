@@ -869,7 +869,7 @@ func (f *Fs) getUploadDomains(ctx context.Context) ([]string, error) {
 	}
 
 	// Cache the domains for 1 hour
-	f.uploadDomains = resp.Data.Domains
+	f.uploadDomains = resp.Data
 	f.uploadDomainsExpiry = time.Now().Add(1 * time.Hour)
 
 	fs.Debugf(f, "Cached %d upload domains, expires at %v", len(f.uploadDomains), f.uploadDomainsExpiry)
@@ -933,7 +933,7 @@ func (f *Fs) singleUpload(ctx context.Context, parentID int64, filename, md5Hash
 	resp := api.Response[api.SingleUploadResponse]{}
 
 	_ = apiSingleUpload.limiter.Wait(ctx)
-	_, err = f.curl.CallJSON(ctx, &opts, nil, &resp)
+	_, err = f.srv.CallJSON(ctx, &opts, nil, &resp)
 	if err != nil {
 		return 0, err
 	}
