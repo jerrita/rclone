@@ -14,6 +14,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rclone/rclone/backend/pan123/api"
@@ -147,7 +148,7 @@ type Fs struct {
 	opt      Options            // parsed options
 	features *fs.Features       // optional features
 	srv      *rest.Client       // the connection to the server
-	curl     *rest.Client       // for download
+	client   *http.Client       // for downloads
 	dirCache *dircache.DirCache // Map of directory path to directory id
 	m        configmap.Mapper   // configmap.Mapper
 
@@ -167,12 +168,14 @@ type Options struct {
 }
 
 type Object struct {
-	fs      *Fs       // what this object is part of
-	remote  string    // The remote path
-	size    int64     // size of the object
-	modTime time.Time // modification time of the object
-	id      string    // ID of the object
-	md5     string    // MD5 of the object content
+	fs          *Fs        // what this object is part of
+	remote      string     // The remote path
+	size        int64      // size of the object
+	modTime     time.Time  // modification time of the object
+	id          string     // ID of the object
+	md5         string     // MD5 of the object content
+	downloadUrl string     // download url of the object
+	mu          sync.Mutex // to protect downloadUrl
 }
 
 func (o *Object) Fs() fs.Info {
@@ -219,34 +222,60 @@ func (o *Object) SetModTime(ctx context.Context, t time.Time) error {
 
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
 	fs.FixRangeOption(options, o.size)
+	fs.Debugf(o, "open object %s with size: %d", o.remote, o.size)
 
+	o.mu.Lock()
+	downloadUrl := o.downloadUrl
+	o.mu.Unlock()
+
+	if downloadUrl == "" {
+		o.mu.Lock()
+		if o.downloadUrl == "" {
+			opts := rest.Opts{
+				Method: apiFileDownload.method,
+				Path:   apiFileDownload.uri,
+			}
+			request := api.GetDownloadInfo{FileId: toId(o.id)}
+			resp := api.Response[api.GetDownloadInfoResponse]{}
+
+			_ = apiFileDownload.limiter.Wait(ctx)
+			_, err := o.fs.srv.CallJSON(ctx, &opts, &request, &resp)
+			if err != nil {
+				o.mu.Unlock()
+				return nil, err
+			}
+
+			if resp.Code != 0 {
+				o.mu.Unlock()
+				return nil, fmt.Errorf("failed to get download url: %d (%s)", resp.Code, resp.Message)
+			}
+
+			o.downloadUrl = resp.Data.DownloadUrl
+			fs.Debugf(o, "download url: %s (%s) => %s", o.remote, o.id, o.downloadUrl)
+		}
+		downloadUrl = o.downloadUrl
+		o.mu.Unlock()
+	}
+
+	cli := rest.NewClient(o.fs.client)
 	opts := rest.Opts{
-		Method: apiFileDownload.method,
-		Path:   apiFileDownload.uri,
-	}
-	request := api.GetDownloadInfo{FileId: toId(o.id)}
-	resp := api.Response[api.GetDownloadInfoResponse]{}
-
-	_ = apiFileDownload.limiter.Wait(ctx)
-	_, err := o.fs.srv.CallJSON(ctx, &opts, &request, &resp)
-	if err != nil {
-		return nil, err
+		Method:  "GET",
+		RootURL: downloadUrl,
 	}
 
-	if resp.Code != 0 {
-		return nil, fmt.Errorf("failed to download: %d (%s)", resp.Code, resp.Message)
+	for _, option := range options {
+		switch x := option.(type) {
+		case *fs.RangeOption:
+			cli.SetHeader("Range", fmt.Sprintf("bytes=%d-%d", x.Start, x.End))
+		}
 	}
 
-	fs.Debugf(o, "download url: %s (%s) => %s", o.remote, o.id, resp.Data.DownloadUrl)
-	opts.RootURL = resp.Data.DownloadUrl
-	opts.Path = ""
-	opts.Method = "GET"
-	d, err := o.fs.curl.Call(ctx, &opts)
+	d, err := cli.Call(ctx, &opts)
 	if err != nil {
 		_ = d.Body.Close()
 		return nil, err
 	}
-	return newOpenFile(o, d), err
+	return d.Body, nil
 }
 
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
@@ -458,12 +487,12 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	srv.SetHeader("Content-Type", "application/json")
 
 	f := &Fs{
-		name: name,
-		root: root,
-		opt:  *opt,
-		srv:  srv,
-		curl: rest.NewClient(client),
-		m:    m,
+		name:   name,
+		root:   root,
+		opt:    *opt,
+		srv:    srv,
+		client: client,
+		m:      m,
 	}
 
 	f.features = (&fs.Features{
@@ -480,7 +509,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	rootId := f.opt.RootId
 	f.dirCache = dircache.New(root, toString(rootId), f)
-	err = f.dirCache.FindRoot(ctx, true)
+	err = f.dirCache.FindRoot(ctx, false)
 	if err != nil {
 		// Assume it is a file
 		newRoot, _ := dircache.SplitPath(root)
