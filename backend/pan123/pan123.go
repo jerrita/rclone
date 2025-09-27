@@ -41,15 +41,17 @@ const (
 var (
 	preRefreshDuration = 7 * 24 * time.Hour
 
-	apiAccessToken    = Api{"/api/v1/access_token", "POST", rate.NewLimiter(rate.Limit(1), 1)}
-	apiFileTrash      = Api{"/api/v1/file/trash", "POST", rate.NewLimiter(rate.Limit(5), 5)}
-	apiFileList       = Api{"/api/v1/file/list", "GET", rate.NewLimiter(rate.Limit(4), 4)}
-	apiFileInfoMulti  = Api{"/api/v1/file/infos", "POST", rate.NewLimiter(rate.Limit(10), 10)}
-	apiFileDownload   = Api{"/api/v1/file/download_info", "GET", rate.NewLimiter(rate.Limit(5), 5)}
-	apiMkdir          = Api{"/upload/v1/file/mkdir", "POST", rate.NewLimiter(rate.Limit(2), 2)}
-	apiFileCreate     = Api{"/upload/v2/file/create", "POST", rate.NewLimiter(rate.Limit(5), 5)}
-	apiUploadSlice    = Api{"/upload/v2/file/slice", "POST", rate.NewLimiter(rate.Limit(20), 20)}
-	apiUploadComplete = Api{"/upload/v2/file/upload_complete", "POST", rate.NewLimiter(rate.Limit(20), 20)}
+	apiAccessToken      = Api{"/api/v1/access_token", "POST", rate.NewLimiter(rate.Limit(1), 1)}
+	apiFileTrash        = Api{"/api/v1/file/trash", "POST", rate.NewLimiter(rate.Limit(5), 5)}
+	apiFileList         = Api{"/api/v1/file/list", "GET", rate.NewLimiter(rate.Limit(4), 4)}
+	apiFileInfoMulti    = Api{"/api/v1/file/infos", "POST", rate.NewLimiter(rate.Limit(10), 10)}
+	apiFileDownload     = Api{"/api/v1/file/download_info", "GET", rate.NewLimiter(rate.Limit(5), 5)}
+	apiMkdir            = Api{"/upload/v1/file/mkdir", "POST", rate.NewLimiter(rate.Limit(2), 2)}
+	apiFileCreate       = Api{"/upload/v2/file/create", "POST", rate.NewLimiter(rate.Limit(5), 5)}
+	apiUploadSlice      = Api{"/upload/v2/file/slice", "POST", rate.NewLimiter(rate.Limit(20), 20)}
+	apiUploadComplete   = Api{"/upload/v2/file/upload_complete", "POST", rate.NewLimiter(rate.Limit(20), 20)}
+	apiGetUploadDomains = Api{"/upload/v2/file/get_upload_domains", "GET", rate.NewLimiter(rate.Limit(5), 5)}
+	apiSingleUpload     = Api{"/upload/v2/file/single/create", "POST", rate.NewLimiter(rate.Limit(5), 5)}
 )
 
 // Register with Fs
@@ -364,17 +366,6 @@ func errorHandler(resp *http.Response) error {
 	return errResponse
 }
 
-// retryErrorCodes is a slice of error codes that we will retry
-// TODO: fixme
-var retryErrorCodes = []int{
-	429, // Too Many Requests.
-	500, // Internal Server Error
-	502, // Bad Gateway
-	503, // Service Unavailable
-	504, // Gateway Timeout
-	509, // Bandwidth Limit Exceeded
-}
-
 func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
 	// Parse config into Options struct
 	opt := new(Options)
@@ -653,38 +644,51 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 		return nil, fmt.Errorf("failed to find/create parent directory: %w", err)
 	}
 
-	// Create file
-	createResp, err := f.createFile(ctx, toId(parentID), leaf, md5Hash, size)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create file: %w", err)
-	}
+	var fileID int64
 
-	// If it's a reuse (instant upload), return object
-	if createResp.Reuse {
-		cf := api.CompleteFile{
-			FileId:       createResp.FileID,
-			FileName:     leaf,
-			ParentFileId: toId(parentID),
-			MD5:          md5Hash,
-			Size:         size,
+	// Choose upload method based on file size
+	// Use single upload for files < 1GB (1073741824 bytes)
+	if size < 1073741824 {
+		fs.Debugf(f, "Using single upload for file %s (size: %d bytes)", remote, size)
+		fileID, err = f.singleUpload(ctx, toId(parentID), leaf, md5Hash, size, buf)
+		if err != nil {
+			return nil, fmt.Errorf("failed to single upload: %w", err)
 		}
-		return f.NewObjectComplete(ctx, remote, cf)
-	}
+	} else {
+		fs.Debugf(f, "Using chunked upload for file %s (size: %d bytes)", remote, size)
+		// Create file
+		createResp, err := f.createFile(ctx, toId(parentID), leaf, md5Hash, size)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create file: %w", err)
+		}
 
-	// Upload file in chunks
-	err = f.uploadChunks(ctx, buf, createResp)
-	if err != nil {
-		return nil, fmt.Errorf("failed to upload chunks: %w", err)
-	}
+		// If it's a reuse (instant upload), return object
+		if createResp.Reuse {
+			cf := api.CompleteFile{
+				FileId:       createResp.FileID,
+				FileName:     leaf,
+				ParentFileId: toId(parentID),
+				MD5:          md5Hash,
+				Size:         size,
+			}
+			return f.NewObjectComplete(ctx, remote, cf)
+		}
 
-	// Complete upload
-	uploadResp, err := f.completeUpload(ctx, createResp.PreUploadId)
-	if err != nil {
-		return nil, fmt.Errorf("failed to complete upload: %w", err)
+		// Upload file in chunks
+		err = f.uploadChunks(ctx, buf, createResp)
+		if err != nil {
+			return nil, fmt.Errorf("failed to upload chunks: %w", err)
+		}
+
+		// Complete upload
+		fileID, err = f.completeUpload(ctx, createResp.PreUploadId)
+		if err != nil {
+			return nil, fmt.Errorf("failed to complete upload: %w", err)
+		}
 	}
 
 	cf := api.CompleteFile{
-		FileId:       uploadResp,
+		FileId:       fileID,
 		FileName:     leaf,
 		ParentFileId: toId(parentID),
 		MD5:          md5Hash,
@@ -831,6 +835,86 @@ func (f *Fs) completeUpload(ctx context.Context, preuploadID string) (int64, err
 		// Wait 1 second before retrying as per documentation
 		time.Sleep(1 * time.Second)
 	}
+}
+
+// getUploadDomains gets the upload domains for single file upload
+func (f *Fs) getUploadDomains(ctx context.Context) ([]string, error) {
+	opts := rest.Opts{
+		Method: apiGetUploadDomains.method,
+		Path:   apiGetUploadDomains.uri,
+	}
+
+	resp := api.Response[api.GetUploadDomainsResponse]{}
+
+	_ = apiGetUploadDomains.limiter.Wait(ctx)
+	_, err := f.srv.CallJSON(ctx, &opts, nil, &resp)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.Code != 0 {
+		return nil, fmt.Errorf("failed to get upload domains: %d (%s)", resp.Code, resp.Message)
+	}
+
+	return resp.Data.Domains, nil
+}
+
+// singleUpload uploads a file using single upload API for files < 1GB
+func (f *Fs) singleUpload(ctx context.Context, parentID int64, filename, md5Hash string, size int64, data []byte) (int64, error) {
+	// Get upload domains
+	domains, err := f.getUploadDomains(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get upload domains: %w", err)
+	}
+
+	if len(domains) == 0 {
+		return 0, errors.New("no upload domains available")
+	}
+
+	// Use the first domain
+	uploadDomain := domains[0]
+
+	// Create multipart form data
+	formData := url.Values{}
+	formData.Set("parentFileID", toString(parentID))
+	formData.Set("filename", filename)
+	formData.Set("etag", md5Hash)
+	formData.Set("size", strconv.FormatInt(size, 10))
+	formData.Set("duplicate", "2") // Always overwrite existing files
+
+	formReader, contentType, overhead, err := rest.MultipartUpload(ctx, bytes.NewReader(data), formData, "file", filename)
+	if err != nil {
+		return 0, fmt.Errorf("failed to create multipart upload: %w", err)
+	}
+
+	contentLength := overhead + int64(len(data))
+
+	opts := rest.Opts{
+		Method:        apiSingleUpload.method,
+		RootURL:       uploadDomain,
+		Path:          apiSingleUpload.uri,
+		Body:          formReader,
+		ContentType:   contentType,
+		ContentLength: &contentLength,
+	}
+
+	resp := api.Response[api.SingleUploadResponse]{}
+
+	_ = apiSingleUpload.limiter.Wait(ctx)
+	_, err = f.curl.CallJSON(ctx, &opts, nil, &resp)
+	if err != nil {
+		return 0, err
+	}
+
+	if resp.Code != 0 {
+		return 0, fmt.Errorf("failed to upload file: %d (%s)", resp.Code, resp.Message)
+	}
+
+	if !resp.Data.Completed {
+		return 0, errors.New("single upload not completed")
+	}
+
+	return resp.Data.FileID, nil
 }
 
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {

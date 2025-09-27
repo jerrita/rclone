@@ -121,6 +121,25 @@ type FileTrashResponse struct {
 	// Usually empty on success, data is null
 }
 
+type GetUploadDomainsResponse struct {
+	Domains []string `json:"domains"` // 上传域名列表
+}
+
+type SingleUploadRequest struct {
+	ParentFileID int64  `json:"parentFileID"` // 父目录ID
+	Filename     string `json:"filename"`     // 文件名
+	Etag         string `json:"etag"`         // 文件MD5
+	Size         int64  `json:"size"`         // 文件大小
+	Duplicate    int    `json:"duplicate"`    // 文件处理策略（1保留两者，2覆盖原文件）
+	ContainDir   bool   `json:"containDir"`   // 上传文件是否包含路径
+	// File field is handled as multipart file upload, not JSON
+}
+
+type SingleUploadResponse struct {
+	FileID    int64 `json:"fileID"`    // 文件ID
+	Completed bool  `json:"completed"` // 是否上传完成
+}
+
 type FileMoveRequest struct {
 	FileIds      []int64 `json:"fileIdList"`   // 要移动的文件ID列表
 	ParentFileId int64   `json:"parentFileId"` // 目标父目录ID
