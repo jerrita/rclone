@@ -90,6 +90,11 @@ func init() {
 			Help:     "when set, rclone will fetch modTime when list files, which will cause extra transitions",
 			Default:  true,
 			Advanced: true,
+		}, {
+			Name:     "slice_all",
+			Help:     "when set, rclone will put every file via sliced upload",
+			Default:  false,
+			Advanced: true,
 		}},
 	})
 }
@@ -156,6 +161,7 @@ type Options struct {
 	AccessToken        string `config:"access_token"`
 	ExpiredAt          string `config:"expired_at"`
 	GetModTimeWhenList bool   `config:"get_mod_time_when_list"`
+	SliceAll           bool   `config:"slice_all"`
 }
 
 type Object struct {
@@ -636,7 +642,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 
 	// Choose upload method based on file size
 	// Use single upload for files < 1GB (1073741824 bytes)
-	if size < 1073741824 {
+	if size < 1073741824 && !f.opt.SliceAll {
 		fs.Debugf(f, "Using single upload for file %s (size: %d bytes)", remote, size)
 		fileID, err = f.singleUpload(ctx, toId(parentID), leaf, md5Hash, size, in)
 		if err != nil {
