@@ -35,6 +35,7 @@ type Api struct {
 const (
 	rootUrl        = "https://open-api.123pan.com"
 	timeMetaLayout = "2006-01-02 15:04:05"
+	maxRetries     = 5
 )
 
 // Globals
@@ -51,7 +52,7 @@ var (
 	apiUploadSlice      = Api{"/upload/v2/file/slice", "POST", rate.NewLimiter(rate.Limit(20), 20)}
 	apiUploadComplete   = Api{"/upload/v2/file/upload_complete", "POST", rate.NewLimiter(rate.Limit(20), 20)}
 	apiGetUploadDomains = Api{"/upload/v2/file/domain", "GET", rate.NewLimiter(rate.Limit(5), 5)}
-	apiSingleUpload     = Api{"/upload/v2/file/single/create", "POST", rate.NewLimiter(rate.Limit(5), 5)}
+	apiSingleUpload     = Api{"/upload/v2/file/single/create", "POST", rate.NewLimiter(rate.Limit(2), 2)}
 )
 
 // Register with Fs
@@ -212,8 +213,7 @@ func (o *Object) Storable() bool {
 }
 
 func (o *Object) SetModTime(ctx context.Context, t time.Time) error {
-	o.modTime = t
-	return nil
+	return fs.ErrorCantSetModTime
 }
 
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
@@ -953,6 +953,14 @@ func (f *Fs) singleUpload(ctx context.Context, parentID int64, filename, md5Hash
 	_, err = f.srv.CallJSON(ctx, &opts, nil, &resp)
 	if err != nil {
 		return 0, err
+	}
+
+	retries := 0
+	for resp.Code == 1 && retries < maxRetries {
+		fs.Debugf(f, "Single upload server internal error, retrying...")
+		_ = apiSingleUpload.limiter.Wait(ctx)
+		_, err = f.srv.CallJSON(ctx, &opts, nil, &resp)
+		retries++
 	}
 
 	if resp.Code != 0 {
