@@ -143,6 +143,10 @@ type Fs struct {
 	curl     *rest.Client       // for download
 	dirCache *dircache.DirCache // Map of directory path to directory id
 	m        configmap.Mapper   // configmap.Mapper
+
+	// Upload domains cache
+	uploadDomains       []string  // cached upload domains
+	uploadDomainsExpiry time.Time // expiry time for upload domains cache
 }
 
 type Options struct {
@@ -837,8 +841,15 @@ func (f *Fs) completeUpload(ctx context.Context, preuploadID string) (int64, err
 	}
 }
 
-// getUploadDomains gets the upload domains for single file upload
+// getUploadDomains gets the upload domains for single file upload with caching
 func (f *Fs) getUploadDomains(ctx context.Context) ([]string, error) {
+	// Check if cached domains are still valid (cache for 1 hour)
+	if len(f.uploadDomains) > 0 && time.Now().Before(f.uploadDomainsExpiry) {
+		fs.Debugf(f, "Using cached upload domains (%d domains)", len(f.uploadDomains))
+		return f.uploadDomains, nil
+	}
+
+	fs.Debugf(f, "Fetching upload domains from API")
 	opts := rest.Opts{
 		Method: apiGetUploadDomains.method,
 		Path:   apiGetUploadDomains.uri,
@@ -856,7 +867,19 @@ func (f *Fs) getUploadDomains(ctx context.Context) ([]string, error) {
 		return nil, fmt.Errorf("failed to get upload domains: %d (%s)", resp.Code, resp.Message)
 	}
 
-	return resp.Data.Domains, nil
+	// Cache the domains for 1 hour
+	f.uploadDomains = resp.Data.Domains
+	f.uploadDomainsExpiry = time.Now().Add(1 * time.Hour)
+
+	fs.Debugf(f, "Cached %d upload domains, expires at %v", len(f.uploadDomains), f.uploadDomainsExpiry)
+	return f.uploadDomains, nil
+}
+
+// clearUploadDomainsCache clears the cached upload domains
+func (f *Fs) clearUploadDomainsCache() {
+	f.uploadDomains = nil
+	f.uploadDomainsExpiry = time.Time{}
+	fs.Debugf(f, "Upload domains cache cleared")
 }
 
 // singleUpload uploads a file using single upload API for files < 1GB
@@ -868,7 +891,15 @@ func (f *Fs) singleUpload(ctx context.Context, parentID int64, filename, md5Hash
 	}
 
 	if len(domains) == 0 {
-		return 0, errors.New("no upload domains available")
+		// Clear cache and try once more if no domains available
+		f.clearUploadDomainsCache()
+		domains, err = f.getUploadDomains(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("failed to get upload domains after cache clear: %w", err)
+		}
+		if len(domains) == 0 {
+			return 0, errors.New("no upload domains available")
+		}
 	}
 
 	// Use the first domain
