@@ -91,9 +91,9 @@ func init() {
 			Default:  true,
 			Advanced: true,
 		}, {
-			Name:     "slice_all",
-			Help:     "when set, rclone will put every file via sliced upload",
-			Default:  false,
+			Name:     "slice_threshold",
+			Help:     "file size greater than this will be sliced, default 42MB",
+			Default:  42 * 1024 * 1024,
 			Advanced: true,
 		}},
 	})
@@ -161,7 +161,7 @@ type Options struct {
 	AccessToken        string `config:"access_token"`
 	ExpiredAt          string `config:"expired_at"`
 	GetModTimeWhenList bool   `config:"get_mod_time_when_list"`
-	SliceAll           bool   `config:"slice_all"`
+	SliceThreshold     int64  `config:"slice_threshold"`
 }
 
 type Object struct {
@@ -668,8 +668,8 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	var fileID int64
 
 	// Choose upload method based on file size
-	// Use single upload for files < 1GB (1073741824 bytes)
-	if size < 1073741824 && !f.opt.SliceAll {
+	// Use single upload for files < SliceThreshold
+	if size < f.opt.SliceThreshold {
 		fs.Debugf(f, "Using single upload for file %s (size: %d bytes)", remote, size)
 		fileID, err = f.singleUpload(ctx, toId(parentID), leaf, md5Hash, size, in)
 		if err != nil {
