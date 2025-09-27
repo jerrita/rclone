@@ -673,7 +673,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 		fs.Debugf(f, "Using single upload for file %s (size: %d bytes)", remote, size)
 		fileID, err = f.singleUpload(ctx, toId(parentID), leaf, md5Hash, size, in)
 		if err != nil {
-			return nil, fmt.Errorf("failed to single upload: %w", err)
+			return nil, fmt.Errorf("failed to single upload: %v", err)
 		}
 	} else {
 		fs.Debugf(f, "Using chunked upload for file %s (size: %d bytes)", remote, size)
@@ -753,15 +753,14 @@ func (f *Fs) uploadChunks(ctx context.Context, reader io.Reader, size int64, cre
 
 	// Use the first server
 	uploadServer := createResp.Servers[0]
-	sliceSize := int(createResp.SliceSize)
+	sliceSize := createResp.SliceSize
 
-	totalChunks := (size + int64(sliceSize) - 1) / int64(sliceSize)
-
-	for i := int64(0); i < totalChunks; i++ {
+	totalChunks := int((size + sliceSize - 1) / sliceSize)
+	for i := range totalChunks {
 		chunkSize := sliceSize
 		if i == totalChunks-1 {
 			// Last chunk might be smaller
-			chunkSize = int(size - i*int64(sliceSize))
+			chunkSize = size - int64(i)*sliceSize
 		}
 
 		// Read chunk data
@@ -810,8 +809,7 @@ func (f *Fs) uploadChunk(ctx context.Context, server, preuploadID string, sliceN
 		ContentLength: &contentLength,
 	}
 
-	resp := api.Response[interface{}]{}
-
+	resp := api.Response[api.NullResponse]{}
 	_ = apiUploadSlice.limiter.Wait(ctx)
 	_, err = f.srv.CallJSON(ctx, &opts, nil, &resp)
 	if err != nil {
