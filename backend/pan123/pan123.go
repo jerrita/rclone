@@ -83,6 +83,11 @@ func init() {
 			Help:     "pan123 open expired_at",
 			Default:  "",
 			Advanced: true,
+		}, {
+			Name:     "get_mod_time_when_list",
+			Help:     "when set, rclone will fetch modTime when list files, which will cause extra transitions",
+			Default:  false,
+			Advanced: true,
 		}},
 	})
 }
@@ -139,11 +144,12 @@ type Fs struct {
 }
 
 type Options struct {
-	ClientId     string `config:"client_id"`
-	ClientSecret string `config:"client_secret"`
-	RootId       int64  `config:"root_id"`
-	AccessToken  string `config:"access_token"`
-	ExpiredAt    string `config:"expired_at"`
+	ClientId           string `config:"client_id"`
+	ClientSecret       string `config:"client_secret"`
+	RootId             int64  `config:"root_id"`
+	AccessToken        string `config:"access_token"`
+	ExpiredAt          string `config:"expired_at"`
+	GetModTimeWhenList bool   `config:"get_mod_time_when_list"`
 }
 
 type Object struct {
@@ -171,6 +177,10 @@ func (o *Object) Remote() string {
 }
 
 func (o *Object) ModTime(ctx context.Context) time.Time {
+	if o.modTime.IsZero() {
+		// TODO: call single file detail api
+		panic("modTime getter not implemented yet")
+	}
 	return o.modTime
 }
 
@@ -395,6 +405,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	f.features = (&fs.Features{
 		CaseInsensitive:         true,
 		CanHaveEmptyDirectories: true,
+		SlowModTime:             true,
 	}).Fill(ctx, f)
 	f.srv.SetErrorHandler(errorHandler)
 
@@ -435,6 +446,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 func (f *Fs) listAll(ctx context.Context, dirId int64) ([]api.CompleteFile, error) {
 	files := make([]api.CompleteFile, 0)
+	fileMap := map[int64]api.CompleteFile{}
 	page := 1
 
 	optsFile := rest.Opts{
@@ -469,6 +481,16 @@ func (f *Fs) listAll(ctx context.Context, dirId int64) ([]api.CompleteFile, erro
 
 		requestMeta.Fields = make([]int64, 0)
 		for _, file := range respFile.Data.FileList {
+			cf := api.CompleteFile{
+				FileId:       file.FileId,
+				FileName:     file.FileName,
+				ParentFileId: file.ParentFileId,
+				Type:         file.Type,
+				MD5:          file.MD5,
+				Size:         file.Size,
+				Status:       file.Status,
+			}
+			fileMap[file.FileId] = cf
 			requestMeta.Fields = append(requestMeta.Fields, file.FileId)
 		}
 
@@ -476,34 +498,44 @@ func (f *Fs) listAll(ctx context.Context, dirId int64) ([]api.CompleteFile, erro
 			break
 		}
 
-		_ = apiFileInfoMulti.limiter.Wait(ctx)
-		_, err = f.srv.CallJSON(ctx, &optsMeta, &requestMeta, &respMeta)
-		if err != nil {
-			return nil, err
-		}
-		if respMeta.Code != 0 {
-			return nil, fmt.Errorf("failed to list file meta: %d (%s)", respMeta.Code, respMeta.Message)
-		}
-
-		for _, meta := range respMeta.Data.FileList {
-			loc, _ := time.LoadLocation("Local")
-			modTime, err := time.ParseInLocation(timeMetaLayout, meta.UpdateAt, loc)
+		if f.opt.GetModTimeWhenList {
+			_ = apiFileInfoMulti.limiter.Wait(ctx)
+			_, err = f.srv.CallJSON(ctx, &optsMeta, &requestMeta, &respMeta)
 			if err != nil {
-				fs.Errorf(f, "cannot parse modified time: %v", err)
+				return nil, err
+			}
+			if respMeta.Code != 0 {
+				return nil, fmt.Errorf("failed to list file meta: %d (%s)", respMeta.Code, respMeta.Message)
 			}
 
-			cf := api.CompleteFile{
-				FileId:       meta.FileId,
-				FileName:     meta.FileName,
-				ParentFileId: meta.ParentFileId,
-				Type:         meta.Type,
-				MD5:          meta.MD5,
-				Size:         meta.Size,
-				Status:       meta.Status,
-				Trashed:      meta.Trashed,
-				ModTime:      modTime,
+			for _, meta := range respMeta.Data.FileList {
+				loc, _ := time.LoadLocation("Local")
+				modTime, err := time.ParseInLocation(timeMetaLayout, meta.UpdateAt, loc)
+				if err != nil {
+					fs.Errorf(f, "cannot parse modified time: %v", err)
+				}
+				// Find the corresponding file in fileMap and add modTime
+				if cf, exists := fileMap[meta.FileId]; exists {
+					cf.ModTime = modTime
+					files = append(files, cf)
+				} else {
+					cf := api.CompleteFile{
+						FileId:       meta.FileId,
+						FileName:     meta.FileName,
+						ParentFileId: meta.ParentFileId,
+						Type:         meta.Type,
+						MD5:          meta.MD5,
+						Size:         meta.Size,
+						Status:       meta.Status,
+						ModTime:      modTime,
+					}
+					files = append(files, cf)
+				}
 			}
-			files = append(files, cf)
+		} else {
+			for _, file := range fileMap {
+				files = append(files, file)
+			}
 		}
 
 		if len(respFile.Data.FileList) < 100 {
@@ -651,14 +683,12 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 		return nil, fmt.Errorf("failed to complete upload: %w", err)
 	}
 
-	// TODO: fix mod time
 	cf := api.CompleteFile{
 		FileId:       uploadResp,
 		FileName:     leaf,
 		ParentFileId: toId(parentID),
 		MD5:          md5Hash,
 		Size:         size,
-		ModTime:      time.Now(),
 	}
 	return f.NewObjectComplete(ctx, remote, cf)
 }
