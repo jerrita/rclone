@@ -122,7 +122,7 @@ type FileTrashResponse struct {
 }
 
 type GetUploadDomainsResponse struct {
-	Domains []string `json:"domains"` // 上传域名列表
+	Domains []string `json:"data"` // 上传域名列表
 }
 
 type SingleUploadRequest struct {

@@ -44,13 +44,13 @@ var (
 	apiAccessToken      = Api{"/api/v1/access_token", "POST", rate.NewLimiter(rate.Limit(1), 1)}
 	apiFileTrash        = Api{"/api/v1/file/trash", "POST", rate.NewLimiter(rate.Limit(5), 5)}
 	apiFileList         = Api{"/api/v1/file/list", "GET", rate.NewLimiter(rate.Limit(4), 4)}
-	apiFileInfoMulti    = Api{"/api/v1/file/infos", "POST", rate.NewLimiter(rate.Limit(10), 10)}
+	apiFileInfoMulti    = Api{"/api/v1/file/infos", "POST", rate.NewLimiter(rate.Limit(4), 4)}
 	apiFileDownload     = Api{"/api/v1/file/download_info", "GET", rate.NewLimiter(rate.Limit(5), 5)}
 	apiMkdir            = Api{"/upload/v1/file/mkdir", "POST", rate.NewLimiter(rate.Limit(2), 2)}
 	apiFileCreate       = Api{"/upload/v2/file/create", "POST", rate.NewLimiter(rate.Limit(5), 5)}
 	apiUploadSlice      = Api{"/upload/v2/file/slice", "POST", rate.NewLimiter(rate.Limit(20), 20)}
 	apiUploadComplete   = Api{"/upload/v2/file/upload_complete", "POST", rate.NewLimiter(rate.Limit(20), 20)}
-	apiGetUploadDomains = Api{"/upload/v2/file/get_upload_domains", "GET", rate.NewLimiter(rate.Limit(5), 5)}
+	apiGetUploadDomains = Api{"/upload/v2/file/domain", "GET", rate.NewLimiter(rate.Limit(5), 5)}
 	apiSingleUpload     = Api{"/upload/v2/file/single/create", "POST", rate.NewLimiter(rate.Limit(5), 5)}
 )
 
