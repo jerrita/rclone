@@ -88,7 +88,7 @@ func init() {
 		}, {
 			Name:     "get_mod_time_when_list",
 			Help:     "when set, rclone will fetch modTime when list files, which will cause extra transitions",
-			Default:  false,
+			Default:  true,
 			Advanced: true,
 		}},
 	})
