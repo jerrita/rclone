@@ -1,6 +1,9 @@
 package api
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 type Response[T any] struct {
 	Code    int    `json:"code"`
@@ -79,21 +82,21 @@ type CreateFileRequest struct {
 
 type CreateFileResponse struct {
 	FileID      int64    `json:"fileID"`      // 文件ID（秒传时返回）
-	PreuploadID string   `json:"preuploadID"` // 预上传ID
+	PreUploadId string   `json:"preuploadID"` // 预上传ID
 	Reuse       bool     `json:"reuse"`       // 是否秒传
 	SliceSize   int64    `json:"sliceSize"`   // 分片大小
 	Servers     []string `json:"servers"`     // 上传地址列表
 }
 
 type UploadSliceRequest struct {
-	PreuploadID string `json:"preuploadID"` // 预上传ID
+	PreUploadId string `json:"preuploadID"` // 预上传ID
 	SliceNo     int    `json:"sliceNo"`     // 分片序号，从1开始
 	SliceMD5    string `json:"sliceMD5"`    // 当前分片MD5
 	// Slice field is handled as multipart file upload, not JSON
 }
 
 type UploadCompleteRequest struct {
-	PreuploadID string `json:"preuploadID"` // 预上传ID
+	PreUploadId string `json:"preuploadID"` // 预上传ID
 }
 
 type UploadCompleteResponse struct {
@@ -102,12 +105,12 @@ type UploadCompleteResponse struct {
 }
 
 type MkdirRequest struct {
-	ParentFileId int64  `json:"parentFileId"` // 父目录ID
-	FileName     string `json:"filename"`     // 目录名
+	Name     string `json:"name"`     // 父目录ID
+	ParentId string `json:"parentID"` // 目录名
 }
 
 type MkdirResponse struct {
-	FileId int64 `json:"fileId"` // 目录ID
+	DirId int64 `json:"dirID"` // 目录ID
 }
 
 type FileTrashRequest struct {
@@ -123,7 +126,7 @@ type FileMoveRequest struct {
 	ParentFileId int64   `json:"parentFileId"` // 目标父目录ID
 }
 
-type FileMoveResponse struct {
+type NullResponse struct {
 	// Usually empty on success
 }
 
@@ -158,16 +161,15 @@ type FileInfo struct {
 }
 
 type CompleteFile struct {
-	FileId       int64  // 文件ID
-	FileName     string // 文件名
-	ParentFileId int64  // 目录ID
-	Type         int    // 0-file 1-folder
-	MD5          string // MD5 (ETag)
-	Size         int64  // 大小
-	Status       int    // 文件审核状态。 大于 100 为审核驳回文件
-	Trashed      int    // 是否在回收站
-	CreateAt     string // 创建时间
-	UpdateAt     string // 更新时间
+	FileId       int64     // 文件ID
+	FileName     string    // 文件名
+	ParentFileId int64     // 目录ID
+	Type         int       // 0-file 1-folder
+	MD5          string    // MD5 (ETag)
+	Size         int64     // 大小
+	Status       int       // 文件审核状态。 大于 100 为审核驳回文件
+	Trashed      int       // 是否在回收站
+	ModTime      time.Time // 更新时间
 }
 
 const (

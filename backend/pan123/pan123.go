@@ -40,7 +40,6 @@ const (
 // Globals
 var (
 	preRefreshDuration = 7 * 24 * time.Hour
-	fileMetaCache      = map[string]api.CompleteFile{}
 
 	apiAccessToken    = Api{"/api/v1/access_token", "POST", rate.NewLimiter(rate.Limit(1), 1)}
 	apiFileTrash      = Api{"/api/v1/file/trash", "POST", rate.NewLimiter(rate.Limit(5), 5)}
@@ -325,8 +324,8 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 	}
 
 	request := api.MkdirRequest{
-		ParentFileId: toId(pathID),
-		FileName:     leaf,
+		Name:     leaf,
+		ParentId: pathID,
 	}
 
 	resp := api.Response[api.MkdirResponse]{}
@@ -341,7 +340,7 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 		return "", fmt.Errorf("failed to create directory: %d (%s)", resp.Code, resp.Message)
 	}
 
-	return toString(resp.Data.FileId), nil
+	return toString(resp.Data.DirId), nil
 }
 
 // errorHandler parses a non 2xx error response into an error
@@ -406,8 +405,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	rootId := f.opt.RootId
 	f.dirCache = dircache.New(root, toString(rootId), f)
-
-	err = f.dirCache.FindRoot(ctx, false)
+	err = f.dirCache.FindRoot(ctx, true)
 	if err != nil {
 		// Assume it is a file
 		newRoot, _ := dircache.SplitPath(root)
@@ -488,6 +486,12 @@ func (f *Fs) listAll(ctx context.Context, dirId int64) ([]api.CompleteFile, erro
 		}
 
 		for _, meta := range respMeta.Data.FileList {
+			loc, _ := time.LoadLocation("Local")
+			modTime, err := time.ParseInLocation(timeMetaLayout, meta.UpdateAt, loc)
+			if err != nil {
+				fs.Errorf(f, "cannot parse modified time: %v", err)
+			}
+
 			cf := api.CompleteFile{
 				FileId:       meta.FileId,
 				FileName:     meta.FileName,
@@ -497,8 +501,7 @@ func (f *Fs) listAll(ctx context.Context, dirId int64) ([]api.CompleteFile, erro
 				Size:         meta.Size,
 				Status:       meta.Status,
 				Trashed:      meta.Trashed,
-				CreateAt:     meta.CreateAt,
-				UpdateAt:     meta.UpdateAt,
+				ModTime:      modTime,
 			}
 			files = append(files, cf)
 		}
@@ -525,16 +528,10 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		remote := path.Join(dir, file.FileName)
 		if file.Type == api.TypeFolder {
 			f.dirCache.Put(remote, toString(file.FileId))
-			loc, _ := time.LoadLocation("Local")
-			modTime, err := time.ParseInLocation(timeMetaLayout, file.UpdateAt, loc)
-			if err != nil {
-				return nil, err
-			}
-			d := fs.NewDir(remote, modTime).SetID(toString(file.FileId)).SetParentID(toString(f.opt.RootId))
+			d := fs.NewDir(remote, file.ModTime).SetID(toString(file.FileId)).SetParentID(toString(f.opt.RootId))
 			entries = append(entries, d)
 		} else {
 			o, err := f.NewObjectComplete(ctx, remote, file)
-			fileMetaCache[remote] = file
 			if err == nil {
 				entries = append(entries, o)
 			} else {
@@ -547,17 +544,11 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 }
 
 func (f *Fs) NewObjectComplete(ctx context.Context, remote string, file api.CompleteFile) (fs.Object, error) {
-	loc, _ := time.LoadLocation("Local")
-	modTime, err := time.ParseInLocation(timeMetaLayout, file.UpdateAt, loc)
-	if err != nil {
-		return nil, err
-	}
-
 	o := &Object{
 		fs:      f,
 		remote:  remote,
 		size:    file.Size,
-		modTime: modTime,
+		modTime: file.ModTime,
 		id:      toString(file.FileId),
 		md5:     file.MD5,
 	}
@@ -566,41 +557,34 @@ func (f *Fs) NewObjectComplete(ctx context.Context, remote string, file api.Comp
 }
 
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
-	o := &Object{
-		fs:     f,
-		remote: remote,
-	}
-
-	root, leaf := dircache.SplitPath(remote)
-	_, err := f.dirCache.FindDir(ctx, root, false)
+	leaf, dirId, err := f.dirCache.FindPath(ctx, remote, false)
 	if err != nil {
-		if err == fs.ErrorDirNotFound {
+		if errors.Is(err, fs.ErrorDirNotFound) {
 			return nil, fs.ErrorObjectNotFound
 		}
 		return nil, err
 	}
 
-	if fileMetaCache[leaf].FileId == 0 {
-		// no cache, refresh
-		_, err := f.List(ctx, root)
-		if err != nil {
-			return nil, err
+	files, err := f.listAll(ctx, toId(dirId))
+	if err != nil {
+		return nil, err
+	}
+
+	for _, file := range files {
+		if file.Type == api.TypeFile && file.FileName == leaf {
+			o := &Object{
+				fs:      f,
+				remote:  remote,
+				size:    file.Size,
+				modTime: file.ModTime,
+				id:      toString(file.FileId),
+				md5:     file.MD5,
+			}
+			return o, nil
 		}
 	}
 
-	if fileMetaCache[leaf].FileId == 0 {
-		return nil, fs.ErrorObjectNotFound
-	}
-
-	cache := fileMetaCache[leaf]
-	o.id = toString(cache.FileId)
-	o.md5 = cache.MD5
-	o.size = cache.Size
-
-	loc, _ := time.LoadLocation("Local")
-	modTime, err := time.ParseInLocation(timeMetaLayout, cache.UpdateAt, loc)
-	o.modTime = modTime
-	return o, err
+	return nil, fs.ErrorObjectNotFound
 }
 
 // Put uploads a new file
@@ -645,7 +629,14 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 
 	// If it's a reuse (instant upload), return object
 	if createResp.Reuse {
-		return f.NewObject(ctx, remote)
+		cf := api.CompleteFile{
+			FileId:       createResp.FileID,
+			FileName:     leaf,
+			ParentFileId: toId(parentID),
+			MD5:          md5Hash,
+			Size:         size,
+		}
+		return f.NewObjectComplete(ctx, remote, cf)
 	}
 
 	// Upload file in chunks
@@ -655,12 +646,21 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	}
 
 	// Complete upload
-	_, err = f.completeUpload(ctx, createResp.PreuploadID)
+	uploadResp, err := f.completeUpload(ctx, createResp.PreUploadId)
 	if err != nil {
 		return nil, fmt.Errorf("failed to complete upload: %w", err)
 	}
 
-	return f.NewObject(ctx, remote)
+	// TODO: fix mod time
+	cf := api.CompleteFile{
+		FileId:       uploadResp,
+		FileName:     leaf,
+		ParentFileId: toId(parentID),
+		MD5:          md5Hash,
+		Size:         size,
+		ModTime:      time.Now(),
+	}
+	return f.NewObjectComplete(ctx, remote, cf)
 }
 
 // createFile creates a file entry and returns upload info
@@ -721,7 +721,7 @@ func (f *Fs) uploadChunks(ctx context.Context, data []byte, createResp *api.Crea
 		hasher.Write(chunk)
 		chunkMD5 := hex.EncodeToString(hasher.Sum(nil))
 
-		err := f.uploadChunk(ctx, uploadServer, createResp.PreuploadID, i+1, chunkMD5, chunk)
+		err := f.uploadChunk(ctx, uploadServer, createResp.PreUploadId, i+1, chunkMD5, chunk)
 		if err != nil {
 			return fmt.Errorf("failed to upload chunk %d: %w", i+1, err)
 		}
@@ -777,7 +777,7 @@ func (f *Fs) completeUpload(ctx context.Context, preuploadID string) (int64, err
 	}
 
 	request := api.UploadCompleteRequest{
-		PreuploadID: preuploadID,
+		PreUploadId: preuploadID,
 	}
 
 	resp := api.Response[api.UploadCompleteResponse]{}
@@ -804,8 +804,7 @@ func (f *Fs) completeUpload(ctx context.Context, preuploadID string) (int64, err
 }
 
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
-	_, err := f.dirCache.FindDir(ctx, dir, true)
-	return err
+	panic("not impled")
 }
 
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
