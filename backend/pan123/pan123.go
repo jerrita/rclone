@@ -42,12 +42,9 @@ var (
 	preRefreshDuration = 7 * 24 * time.Hour
 	fileMetaCache      = map[string]api.CompleteFile{}
 
-	apiUserInfo       = Api{"/api/v1/user/info", "", rate.NewLimiter(rate.Limit(1), 1)}
 	apiAccessToken    = Api{"/api/v1/access_token", "POST", rate.NewLimiter(rate.Limit(1), 1)}
-	apiFileMove       = Api{"/api/v1/file/move", "", rate.NewLimiter(rate.Limit(1), 1)}
-	apiFileDelete     = Api{"/api/v1/file/delete", "", rate.NewLimiter(rate.Limit(1), 1)}
+	apiFileTrash      = Api{"/api/v1/file/trash", "POST", rate.NewLimiter(rate.Limit(5), 5)}
 	apiFileList       = Api{"/api/v1/file/list", "GET", rate.NewLimiter(rate.Limit(4), 4)}
-	apiFileDetail     = Api{"/api/v1/file/detail", "GET", rate.NewLimiter(rate.Limit(4), 4)}
 	apiFileInfoMulti  = Api{"/api/v1/file/infos", "POST", rate.NewLimiter(rate.Limit(10), 10)}
 	apiFileDownload   = Api{"/api/v1/file/download_info", "GET", rate.NewLimiter(rate.Limit(5), 5)}
 	apiMkdir          = Api{"/upload/v1/file/mkdir", "POST", rate.NewLimiter(rate.Limit(2), 2)}
@@ -246,17 +243,17 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 
 func (o *Object) Remove(ctx context.Context) error {
 	opts := rest.Opts{
-		Method: apiFileDelete.method,
-		Path:   apiFileDelete.uri,
+		Method: apiFileTrash.method,
+		Path:   apiFileTrash.uri,
 	}
 
-	request := api.FileDeleteRequest{
-		FileIds: []int64{toId(o.id)},
+	request := api.FileTrashRequest{
+		FileIDs: []int64{toId(o.id)},
 	}
 
-	resp := api.Response[api.FileDeleteResponse]{}
+	resp := api.Response[api.FileTrashResponse]{}
 
-	_ = apiFileDelete.limiter.Wait(ctx)
+	_ = apiFileTrash.limiter.Wait(ctx)
 	_, err := o.fs.srv.CallJSON(ctx, &opts, &request, &resp)
 	if err != nil {
 		return err
@@ -829,17 +826,17 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 
 	// Delete the directory
 	opts := rest.Opts{
-		Method: apiFileDelete.method,
-		Path:   apiFileDelete.uri,
+		Method: apiFileTrash.method,
+		Path:   apiFileTrash.uri,
 	}
 
-	request := api.FileDeleteRequest{
-		FileIds: []int64{toId(pathID)},
+	request := api.FileTrashRequest{
+		FileIDs: []int64{toId(pathID)},
 	}
 
-	resp := api.Response[api.FileDeleteResponse]{}
+	resp := api.Response[api.FileTrashResponse]{}
 
-	_ = apiFileDelete.limiter.Wait(ctx)
+	_ = apiFileTrash.limiter.Wait(ctx)
 	_, err = f.srv.CallJSON(ctx, &opts, &request, &resp)
 	if err != nil {
 		return err

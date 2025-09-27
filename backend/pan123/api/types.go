@@ -110,12 +110,12 @@ type MkdirResponse struct {
 	FileId int64 `json:"fileId"` // 目录ID
 }
 
-type FileDeleteRequest struct {
-	FileIds []int64 `json:"fileIdList"` // 要删除的文件ID列表
+type FileTrashRequest struct {
+	FileIDs []int64 `json:"fileIDs"` // 要删除的文件ID数组，一次性最大不能超过100个文件
 }
 
-type FileDeleteResponse struct {
-	// Usually empty on success
+type FileTrashResponse struct {
+	// Usually empty on success, data is null
 }
 
 type FileMoveRequest struct {
