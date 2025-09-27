@@ -206,7 +206,8 @@ func (o *Object) Storable() bool {
 }
 
 func (o *Object) SetModTime(ctx context.Context, t time.Time) error {
-	return errors.New("SetModTime not supported on this backend")
+	o.modTime = t
+	return nil
 }
 
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
