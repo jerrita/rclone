@@ -627,8 +627,8 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	size := src.Size()
 
 	md5Hash, err := src.Hash(ctx, hash.MD5)
-	if err != nil {
-		return nil, fmt.Errorf("src do not support md5 sum: %v", err)
+	if err != nil || md5Hash == "" {
+		return nil, fmt.Errorf("src %s do not support md5 sum: %v", src.Fs().Name(), err)
 	}
 
 	// Get parent directory
