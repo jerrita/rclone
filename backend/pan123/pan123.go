@@ -620,27 +620,10 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	remote := src.Remote()
 	size := src.Size()
 
-	// Calculate file MD5
-	var buf []byte
-	var err error
-	if size >= 0 {
-		buf = make([]byte, size)
-		_, err = io.ReadFull(in, buf)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read file: %w", err)
-		}
-	} else {
-		buf, err = io.ReadAll(in)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read file: %w", err)
-		}
-		size = int64(len(buf))
+	md5Hash, err := src.Hash(ctx, hash.MD5)
+	if err != nil {
+		return nil, fmt.Errorf("src do not support md5 sum: %v", err)
 	}
-
-	// Calculate MD5
-	hasher := md5.New()
-	hasher.Write(buf)
-	md5Hash := hex.EncodeToString(hasher.Sum(nil))
 
 	// Get parent directory
 	root, leaf := dircache.SplitPath(remote)
@@ -655,19 +638,17 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	// Use single upload for files < 1GB (1073741824 bytes)
 	if size < 1073741824 {
 		fs.Debugf(f, "Using single upload for file %s (size: %d bytes)", remote, size)
-		fileID, err = f.singleUpload(ctx, toId(parentID), leaf, md5Hash, size, buf)
+		fileID, err = f.singleUpload(ctx, toId(parentID), leaf, md5Hash, size, in)
 		if err != nil {
 			return nil, fmt.Errorf("failed to single upload: %w", err)
 		}
 	} else {
 		fs.Debugf(f, "Using chunked upload for file %s (size: %d bytes)", remote, size)
-		// Create file
 		createResp, err := f.createFile(ctx, toId(parentID), leaf, md5Hash, size)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create file: %w", err)
 		}
 
-		// If it's a reuse (instant upload), return object
 		if createResp.Reuse {
 			cf := api.CompleteFile{
 				FileId:       createResp.FileID,
@@ -679,13 +660,11 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 			return f.NewObjectComplete(ctx, remote, cf)
 		}
 
-		// Upload file in chunks
-		err = f.uploadChunks(ctx, buf, createResp)
+		err = f.uploadChunks(ctx, in, size, createResp)
 		if err != nil {
 			return nil, fmt.Errorf("failed to upload chunks: %w", err)
 		}
 
-		// Complete upload
 		fileID, err = f.completeUpload(ctx, createResp.PreUploadId)
 		if err != nil {
 			return nil, fmt.Errorf("failed to complete upload: %w", err)
@@ -734,7 +713,7 @@ func (f *Fs) createFile(ctx context.Context, parentID int64, filename, etag stri
 }
 
 // uploadChunks uploads file chunks to the server
-func (f *Fs) uploadChunks(ctx context.Context, data []byte, createResp *api.CreateFileResponse) error {
+func (f *Fs) uploadChunks(ctx context.Context, reader io.Reader, size int64, createResp *api.CreateFileResponse) error {
 	if len(createResp.Servers) == 0 {
 		return errors.New("no upload servers available")
 	}
@@ -743,24 +722,29 @@ func (f *Fs) uploadChunks(ctx context.Context, data []byte, createResp *api.Crea
 	uploadServer := createResp.Servers[0]
 	sliceSize := int(createResp.SliceSize)
 
-	// Split file into chunks
-	totalChunks := (len(data) + sliceSize - 1) / sliceSize
+	totalChunks := (size + int64(sliceSize) - 1) / int64(sliceSize)
 
-	for i := 0; i < totalChunks; i++ {
-		start := i * sliceSize
-		end := start + sliceSize
-		if end > len(data) {
-			end = len(data)
+	for i := int64(0); i < totalChunks; i++ {
+		chunkSize := sliceSize
+		if i == totalChunks-1 {
+			// Last chunk might be smaller
+			chunkSize = int(size - i*int64(sliceSize))
 		}
 
-		chunk := data[start:end]
+		// Read chunk data
+		chunk := make([]byte, chunkSize)
+		n, err := io.ReadFull(reader, chunk)
+		if err != nil && err != io.ErrUnexpectedEOF {
+			return fmt.Errorf("failed to read chunk %d: %w", i+1, err)
+		}
+		chunk = chunk[:n]
 
 		// Calculate chunk MD5
 		hasher := md5.New()
 		hasher.Write(chunk)
 		chunkMD5 := hex.EncodeToString(hasher.Sum(nil))
 
-		err := f.uploadChunk(ctx, uploadServer, createResp.PreUploadId, i+1, chunkMD5, chunk)
+		err = f.uploadChunk(ctx, uploadServer, createResp.PreUploadId, int(i+1), chunkMD5, chunk)
 		if err != nil {
 			return fmt.Errorf("failed to upload chunk %d: %w", i+1, err)
 		}
@@ -884,7 +868,7 @@ func (f *Fs) clearUploadDomainsCache() {
 }
 
 // singleUpload uploads a file using single upload API for files < 1GB
-func (f *Fs) singleUpload(ctx context.Context, parentID int64, filename, md5Hash string, size int64, data []byte) (int64, error) {
+func (f *Fs) singleUpload(ctx context.Context, parentID int64, filename, md5Hash string, size int64, reader io.Reader) (int64, error) {
 	// Get upload domains
 	domains, err := f.getUploadDomains(ctx)
 	if err != nil {
@@ -914,12 +898,12 @@ func (f *Fs) singleUpload(ctx context.Context, parentID int64, filename, md5Hash
 	formData.Set("size", strconv.FormatInt(size, 10))
 	formData.Set("duplicate", "2") // Always overwrite existing files
 
-	formReader, contentType, overhead, err := rest.MultipartUpload(ctx, bytes.NewReader(data), formData, "file", filename)
+	formReader, contentType, overhead, err := rest.MultipartUpload(ctx, reader, formData, "file", filename)
 	if err != nil {
 		return 0, fmt.Errorf("failed to create multipart upload: %w", err)
 	}
 
-	contentLength := overhead + int64(len(data))
+	contentLength := overhead + size
 
 	opts := rest.Opts{
 		Method:        apiSingleUpload.method,
