@@ -626,7 +626,34 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	remote := src.Remote()
 	size := src.Size()
 
-	md5Hash, err := src.Hash(ctx, hash.MD5)
+	var md5Hash string
+	var err error
+
+	if src.Fs().Name() == f.name {
+		// restic fix
+		// for file from memory, we need to hash it manually
+		var buf []byte
+		if size > 0 {
+			buf = make([]byte, size)
+			_, err = io.ReadFull(in, buf)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read file: %w", err)
+			}
+		} else {
+			buf, err = io.ReadAll(in)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read file: %w", err)
+			}
+			size = int64(len(buf))
+		}
+		hasher := md5.New()
+		hasher.Write(buf)
+		md5Hash = hex.EncodeToString(hasher.Sum(nil))
+		in = bytes.NewReader(buf)
+	} else {
+		md5Hash, err = src.Hash(ctx, hash.MD5)
+	}
+
 	if err != nil || md5Hash == "" {
 		return nil, fmt.Errorf("src %s do not support md5 sum: %v", src.Fs().Name(), err)
 	}
