@@ -940,7 +940,8 @@ func (f *Fs) singleUpload(ctx context.Context, parentID int64, filename, md5Hash
 }
 
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
-	panic("not impled")
+	_, err := f.dirCache.FindDir(ctx, dir, true)
+	return err
 }
 
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
