@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	stdhash "hash"
 	"io"
 	"net/http"
 	"net/url"
@@ -242,9 +243,10 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	opts.Method = "GET"
 	d, err := o.fs.curl.Call(ctx, &opts)
 	if err != nil {
+		_ = d.Body.Close()
 		return nil, err
 	}
-	return d.Body, err
+	return newOpenFile(o, d), err
 }
 
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
@@ -287,6 +289,66 @@ func (o *Object) Remove(ctx context.Context) error {
 
 	return nil
 }
+
+// openFile represents an Object open for reading
+type openFile struct {
+	o     *Object        // Object we are reading for
+	resp  *http.Response // response of the GET
+	body  io.Reader      // reading from here
+	hash  stdhash.Hash   // MD5 hash of the data read
+	bytes int64          // number of bytes read on this connection
+	eof   bool           // whether we have read end of file
+}
+
+// newOpenFile wraps an io.ReadCloser and checks the sha1sum
+func newOpenFile(o *Object, resp *http.Response) *openFile {
+	file := &openFile{
+		o:    o,
+		resp: resp,
+		hash: md5.New(),
+	}
+	file.body = io.TeeReader(resp.Body, file.hash)
+	return file
+}
+
+// Read bytes from the object - see io.Reader
+func (file *openFile) Read(p []byte) (n int, err error) {
+	n, err = file.body.Read(p)
+	file.bytes += int64(n)
+	if err == io.EOF {
+		file.eof = true
+	}
+	return
+}
+
+// Close the object and checks the length and SHA1 if all the object
+// was read
+func (file *openFile) Close() (err error) {
+	// Close the body at the end
+	defer fs.CheckClose(file.resp.Body, &err)
+
+	// If not end of file then can't check SHA1
+	if !file.eof {
+		return nil
+	}
+
+	// Check to see we read the correct number of bytes
+	if file.o.Size() != file.bytes {
+		return fmt.Errorf("corrupted on transfer: lengths differ want %d vs got %d", file.o.Size(), file.bytes)
+	}
+
+	// Check the MD5
+	receivedMD5 := file.o.md5
+	calculatedMD5 := fmt.Sprintf("%x", file.hash.Sum(nil))
+	if receivedMD5 != "" && receivedMD5 != calculatedMD5 {
+		return fmt.Errorf("corrupted on transfer: MD5 hashes differ want %q vs got %q", receivedMD5, calculatedMD5)
+	}
+
+	return nil
+}
+
+// Check it satisfies the interfaces
+var _ io.ReadCloser = &openFile{}
 
 // ------------------------------------------------------------
 
