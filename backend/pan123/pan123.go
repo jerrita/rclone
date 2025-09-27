@@ -1,11 +1,15 @@
 package pan123
 
 import (
+	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"path"
 	"strconv"
 	"strings"
@@ -38,16 +42,18 @@ var (
 	preRefreshDuration = 7 * 24 * time.Hour
 	fileMetaCache      = map[string]api.CompleteFile{}
 
-	apiUserInfo      = Api{"/api/v1/user/info", "", rate.NewLimiter(rate.Limit(1), 1)}
-	apiAccessToken   = Api{"/api/v1/access_token", "POST", rate.NewLimiter(rate.Limit(1), 1)}
-	apiFileMove      = Api{"/api/v1/file/move", "", rate.NewLimiter(rate.Limit(1), 1)}
-	apiFileDelete    = Api{"/api/v1/file/delete", "", rate.NewLimiter(rate.Limit(1), 1)}
-	apiFileList      = Api{"/api/v1/file/list", "GET", rate.NewLimiter(rate.Limit(4), 4)}
-	apiFileDetail    = Api{"/api/v1/file/detail", "GET", rate.NewLimiter(rate.Limit(4), 4)}
-	apiFileInfoMulti = Api{"/api/v1/file/infos", "POST", rate.NewLimiter(rate.Limit(10), 10)}
-	apiFileDownload  = Api{"/api/v1/file/download_info", "GET", rate.NewLimiter(rate.Limit(5), 5)}
-	apiMkdir         = Api{"/upload/v1/file/mkdir", "", rate.NewLimiter(rate.Limit(2), 2)}
-	apiFileCreate    = Api{"/upload/v1/file/create", "", rate.NewLimiter(rate.Limit(2), 2)}
+	apiUserInfo       = Api{"/api/v1/user/info", "", rate.NewLimiter(rate.Limit(1), 1)}
+	apiAccessToken    = Api{"/api/v1/access_token", "POST", rate.NewLimiter(rate.Limit(1), 1)}
+	apiFileMove       = Api{"/api/v1/file/move", "", rate.NewLimiter(rate.Limit(1), 1)}
+	apiFileDelete     = Api{"/api/v1/file/delete", "", rate.NewLimiter(rate.Limit(1), 1)}
+	apiFileList       = Api{"/api/v1/file/list", "GET", rate.NewLimiter(rate.Limit(4), 4)}
+	apiFileDetail     = Api{"/api/v1/file/detail", "GET", rate.NewLimiter(rate.Limit(4), 4)}
+	apiFileInfoMulti  = Api{"/api/v1/file/infos", "POST", rate.NewLimiter(rate.Limit(10), 10)}
+	apiFileDownload   = Api{"/api/v1/file/download_info", "GET", rate.NewLimiter(rate.Limit(5), 5)}
+	apiMkdir          = Api{"/upload/v1/file/mkdir", "POST", rate.NewLimiter(rate.Limit(2), 2)}
+	apiFileCreate     = Api{"/upload/v2/file/create", "POST", rate.NewLimiter(rate.Limit(5), 5)}
+	apiUploadSlice    = Api{"/upload/v2/file/slice", "POST", rate.NewLimiter(rate.Limit(20), 20)}
+	apiUploadComplete = Api{"/upload/v2/file/upload_complete", "POST", rate.NewLimiter(rate.Limit(20), 20)}
 )
 
 // Register with Fs
@@ -223,13 +229,44 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 }
 
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	//TODO implement me
-	panic("implement me")
+	newObj, err := o.fs.Put(ctx, in, src, options...)
+	if err != nil {
+		return err
+	}
+
+	// Update the object with new metadata
+	newO := newObj.(*Object)
+	o.size = newO.size
+	o.modTime = newO.modTime
+	o.md5 = newO.md5
+	o.id = newO.id
+
+	return nil
 }
 
 func (o *Object) Remove(ctx context.Context) error {
-	//TODO implement me
-	panic("implement me")
+	opts := rest.Opts{
+		Method: apiFileDelete.method,
+		Path:   apiFileDelete.uri,
+	}
+
+	request := api.FileDeleteRequest{
+		FileIds: []int64{toId(o.id)},
+	}
+
+	resp := api.Response[api.FileDeleteResponse]{}
+
+	_ = apiFileDelete.limiter.Wait(ctx)
+	_, err := o.fs.srv.CallJSON(ctx, &opts, &request, &resp)
+	if err != nil {
+		return err
+	}
+
+	if resp.Code != 0 {
+		return fmt.Errorf("failed to delete file: %d (%s)", resp.Code, resp.Message)
+	}
+
+	return nil
 }
 
 // ------------------------------------------------------------
@@ -285,8 +322,29 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut strin
 }
 
 func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, err error) {
-	//TODO implement me
-	panic("implement me")
+	opts := rest.Opts{
+		Method: apiMkdir.method,
+		Path:   apiMkdir.uri,
+	}
+
+	request := api.MkdirRequest{
+		ParentFileId: toId(pathID),
+		FileName:     leaf,
+	}
+
+	resp := api.Response[api.MkdirResponse]{}
+
+	_ = apiMkdir.limiter.Wait(ctx)
+	_, err = f.srv.CallJSON(ctx, &opts, &request, &resp)
+	if err != nil {
+		return "", err
+	}
+
+	if resp.Code != 0 {
+		return "", fmt.Errorf("failed to create directory: %d (%s)", resp.Code, resp.Message)
+	}
+
+	return toString(resp.Data.FileId), nil
 }
 
 // errorHandler parses a non 2xx error response into an error
@@ -419,6 +477,10 @@ func (f *Fs) listAll(ctx context.Context, dirId int64) ([]api.CompleteFile, erro
 			requestMeta.Fields = append(requestMeta.Fields, file.FileId)
 		}
 
+		if len(requestMeta.Fields) == 0 {
+			break
+		}
+
 		_ = apiFileInfoMulti.limiter.Wait(ctx)
 		_, err = f.srv.CallJSON(ctx, &optsMeta, &requestMeta, &respMeta)
 		if err != nil {
@@ -544,16 +606,253 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	return o, err
 }
 
+// Put uploads a new file
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	panic("not implemented yet")
+	remote := src.Remote()
+	size := src.Size()
+
+	// Calculate file MD5
+	var buf []byte
+	var err error
+	if size >= 0 {
+		buf = make([]byte, size)
+		_, err = io.ReadFull(in, buf)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read file: %w", err)
+		}
+	} else {
+		buf, err = io.ReadAll(in)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read file: %w", err)
+		}
+		size = int64(len(buf))
+	}
+
+	// Calculate MD5
+	hasher := md5.New()
+	hasher.Write(buf)
+	md5Hash := hex.EncodeToString(hasher.Sum(nil))
+
+	// Get parent directory
+	root, leaf := dircache.SplitPath(remote)
+	parentID, err := f.dirCache.FindDir(ctx, root, false)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find parent directory: %w", err)
+	}
+
+	// Create file
+	createResp, err := f.createFile(ctx, toId(parentID), leaf, md5Hash, size)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create file: %w", err)
+	}
+
+	// If it's a reuse (instant upload), return object
+	if createResp.Reuse {
+		return f.NewObject(ctx, remote)
+	}
+
+	// Upload file in chunks
+	err = f.uploadChunks(ctx, buf, createResp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to upload chunks: %w", err)
+	}
+
+	// Complete upload
+	_, err = f.completeUpload(ctx, createResp.PreuploadID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to complete upload: %w", err)
+	}
+
+	return f.NewObject(ctx, remote)
+}
+
+// createFile creates a file entry and returns upload info
+func (f *Fs) createFile(ctx context.Context, parentID int64, filename, etag string, size int64) (*api.CreateFileResponse, error) {
+	opts := rest.Opts{
+		Method: apiFileCreate.method,
+		Path:   apiFileCreate.uri,
+	}
+
+	request := api.CreateFileRequest{
+		ParentFileID: parentID,
+		Filename:     filename,
+		Etag:         etag,
+		Size:         size,
+		Duplicate:    2,     // Always overwrite existing files
+		ContainDir:   false, // Don't use path-based uploads
+	}
+
+	resp := api.Response[api.CreateFileResponse]{}
+
+	_ = apiFileCreate.limiter.Wait(ctx)
+	_, err := f.srv.CallJSON(ctx, &opts, &request, &resp)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.Code != 0 {
+		return nil, fmt.Errorf("failed to create file: %d (%s)", resp.Code, resp.Message)
+	}
+
+	return &resp.Data, nil
+}
+
+// uploadChunks uploads file chunks to the server
+func (f *Fs) uploadChunks(ctx context.Context, data []byte, createResp *api.CreateFileResponse) error {
+	if len(createResp.Servers) == 0 {
+		return errors.New("no upload servers available")
+	}
+
+	// Use the first server
+	uploadServer := createResp.Servers[0]
+	sliceSize := int(createResp.SliceSize)
+
+	// Split file into chunks
+	totalChunks := (len(data) + sliceSize - 1) / sliceSize
+
+	for i := 0; i < totalChunks; i++ {
+		start := i * sliceSize
+		end := start + sliceSize
+		if end > len(data) {
+			end = len(data)
+		}
+
+		chunk := data[start:end]
+
+		// Calculate chunk MD5
+		hasher := md5.New()
+		hasher.Write(chunk)
+		chunkMD5 := hex.EncodeToString(hasher.Sum(nil))
+
+		err := f.uploadChunk(ctx, uploadServer, createResp.PreuploadID, i+1, chunkMD5, chunk)
+		if err != nil {
+			return fmt.Errorf("failed to upload chunk %d: %w", i+1, err)
+		}
+	}
+
+	return nil
+}
+
+// uploadChunk uploads a single chunk
+func (f *Fs) uploadChunk(ctx context.Context, server, preuploadID string, sliceNo int, sliceMD5 string, chunk []byte) error {
+	// Create multipart form data
+	formData := url.Values{}
+	formData.Set("preuploadID", preuploadID)
+	formData.Set("sliceNo", strconv.Itoa(sliceNo))
+	formData.Set("sliceMD5", sliceMD5)
+
+	formReader, contentType, overhead, err := rest.MultipartUpload(ctx, bytes.NewReader(chunk), formData, "slice", "chunk")
+	if err != nil {
+		return fmt.Errorf("failed to create multipart upload: %w", err)
+	}
+
+	contentLength := overhead + int64(len(chunk))
+
+	opts := rest.Opts{
+		Method:        apiUploadSlice.method,
+		RootURL:       server,
+		Path:          apiUploadSlice.uri,
+		Body:          formReader,
+		ContentType:   contentType,
+		ContentLength: &contentLength,
+	}
+
+	resp := api.Response[interface{}]{}
+
+	_ = apiUploadSlice.limiter.Wait(ctx)
+	_, err = f.srv.CallJSON(ctx, &opts, nil, &resp)
+	if err != nil {
+		return err
+	}
+
+	if resp.Code != 0 {
+		return fmt.Errorf("failed to upload chunk: %d (%s)", resp.Code, resp.Message)
+	}
+
+	return nil
+}
+
+// completeUpload notifies the server that upload is complete and returns file ID
+func (f *Fs) completeUpload(ctx context.Context, preuploadID string) (int64, error) {
+	opts := rest.Opts{
+		Method: apiUploadComplete.method,
+		Path:   apiUploadComplete.uri,
+	}
+
+	request := api.UploadCompleteRequest{
+		PreuploadID: preuploadID,
+	}
+
+	resp := api.Response[api.UploadCompleteResponse]{}
+
+	// May need to retry/poll until upload is complete
+	for {
+		_ = apiUploadComplete.limiter.Wait(ctx)
+		_, err := f.srv.CallJSON(ctx, &opts, &request, &resp)
+		if err != nil {
+			return 0, err
+		}
+
+		if resp.Code != 0 && resp.Code != 20103 {
+			return 0, fmt.Errorf("failed to complete upload: %d (%s)", resp.Code, resp.Message)
+		}
+
+		if resp.Data.Completed {
+			return resp.Data.FileID, nil
+		}
+
+		// Wait 1 second before retrying as per documentation
+		time.Sleep(1 * time.Second)
+	}
 }
 
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
-	panic("not implemented yet")
+	_, err := f.dirCache.FindDir(ctx, dir, true)
+	return err
 }
 
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
-	panic("not implemented yet")
+	pathID, err := f.dirCache.FindDir(ctx, dir, false)
+	if err != nil {
+		return err
+	}
+
+	// Check if directory is empty
+	files, err := f.listAll(ctx, toId(pathID))
+	if err != nil {
+		return fmt.Errorf("failed to list directory contents: %w", err)
+	}
+
+	if len(files) > 0 {
+		return fs.ErrorDirectoryNotEmpty
+	}
+
+	// Delete the directory
+	opts := rest.Opts{
+		Method: apiFileDelete.method,
+		Path:   apiFileDelete.uri,
+	}
+
+	request := api.FileDeleteRequest{
+		FileIds: []int64{toId(pathID)},
+	}
+
+	resp := api.Response[api.FileDeleteResponse]{}
+
+	_ = apiFileDelete.limiter.Wait(ctx)
+	_, err = f.srv.CallJSON(ctx, &opts, &request, &resp)
+	if err != nil {
+		return err
+	}
+
+	if resp.Code != 0 {
+		return fmt.Errorf("failed to delete directory: %d (%s)", resp.Code, resp.Message)
+	}
+
+	// Remove from cache
+	f.dirCache.FlushDir(dir)
+
+	return nil
 }
 
 func toString(x int64) string {

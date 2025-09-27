@@ -68,6 +68,65 @@ type GetDownloadInfoResponse struct {
 	DownloadUrl string `json:"downloadUrl"`
 }
 
+type CreateFileRequest struct {
+	ParentFileID int64  `json:"parentFileID"` // 父目录ID
+	Filename     string `json:"filename"`     // 文件名
+	Etag         string `json:"etag"`         // 文件MD5
+	Size         int64  `json:"size"`         // 文件大小
+	Duplicate    int    `json:"duplicate"`    // 文件处理策略（1保留两者，2覆盖原文件）
+	ContainDir   bool   `json:"containDir"`   // 上传文件是否包含路径
+}
+
+type CreateFileResponse struct {
+	FileID      int64    `json:"fileID"`      // 文件ID（秒传时返回）
+	PreuploadID string   `json:"preuploadID"` // 预上传ID
+	Reuse       bool     `json:"reuse"`       // 是否秒传
+	SliceSize   int64    `json:"sliceSize"`   // 分片大小
+	Servers     []string `json:"servers"`     // 上传地址列表
+}
+
+type UploadSliceRequest struct {
+	PreuploadID string `json:"preuploadID"` // 预上传ID
+	SliceNo     int    `json:"sliceNo"`     // 分片序号，从1开始
+	SliceMD5    string `json:"sliceMD5"`    // 当前分片MD5
+	// Slice field is handled as multipart file upload, not JSON
+}
+
+type UploadCompleteRequest struct {
+	PreuploadID string `json:"preuploadID"` // 预上传ID
+}
+
+type UploadCompleteResponse struct {
+	Completed bool  `json:"completed"` // 上传是否完成
+	FileID    int64 `json:"fileID"`    // 上传完成文件ID
+}
+
+type MkdirRequest struct {
+	ParentFileId int64  `json:"parentFileId"` // 父目录ID
+	FileName     string `json:"filename"`     // 目录名
+}
+
+type MkdirResponse struct {
+	FileId int64 `json:"fileId"` // 目录ID
+}
+
+type FileDeleteRequest struct {
+	FileIds []int64 `json:"fileIdList"` // 要删除的文件ID列表
+}
+
+type FileDeleteResponse struct {
+	// Usually empty on success
+}
+
+type FileMoveRequest struct {
+	FileIds      []int64 `json:"fileIdList"`   // 要移动的文件ID列表
+	ParentFileId int64   `json:"parentFileId"` // 目标父目录ID
+}
+
+type FileMoveResponse struct {
+	// Usually empty on success
+}
+
 type File struct {
 	FileId       int64  `json:"fileID"`       // 文件ID
 	FileName     string `json:"fileName"`     // 文件名
