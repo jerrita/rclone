@@ -19,11 +19,13 @@ import (
 
 	"github.com/rclone/rclone/backend/pan123/api"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/dircache"
+	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/rest"
 	"golang.org/x/time/rate"
 )
@@ -153,8 +155,9 @@ type Fs struct {
 	m        configmap.Mapper   // configmap.Mapper
 
 	// Upload domains cache
-	uploadDomains       []string  // cached upload domains
-	uploadDomainsExpiry time.Time // expiry time for upload domains cache
+	uploadDomains       []string              // cached upload domains
+	uploadDomainsExpiry time.Time             // expiry time for upload domains cache
+	uploadToken         *pacer.TokenDispenser // control concurrency
 }
 
 type Options struct {
@@ -486,13 +489,15 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	srv.SetHeader("Platform", "open_platform")
 	srv.SetHeader("Content-Type", "application/json")
 
+	ci := fs.GetConfig(ctx)
 	f := &Fs{
-		name:   name,
-		root:   root,
-		opt:    *opt,
-		srv:    srv,
-		client: client,
-		m:      m,
+		name:        name,
+		root:        root,
+		opt:         *opt,
+		srv:         srv,
+		client:      client,
+		m:           m,
+		uploadToken: pacer.NewTokenDispenser(ci.Transfers),
 	}
 
 	f.features = (&fs.Features{
@@ -836,7 +841,7 @@ func (f *Fs) createFile(ctx context.Context, parentID int64, filename, etag stri
 	return &resp.Data, nil
 }
 
-// uploadChunks uploads file chunks to the server
+// uploadChunks uploads file chunks to the server using parallel uploads
 func (f *Fs) uploadChunks(ctx context.Context, reader io.Reader, size int64, createResp *api.CreateFileResponse) error {
 	if len(createResp.Servers) == 0 {
 		return errors.New("no upload servers available")
@@ -846,8 +851,27 @@ func (f *Fs) uploadChunks(ctx context.Context, reader io.Reader, size int64, cre
 	uploadServer := createResp.Servers[0]
 	sliceSize := createResp.SliceSize
 
+	// unwrap the accounting from the input, we use wrap to put it
+	// back on after the buffering
+	reader, wrap := accounting.UnWrap(reader)
+
 	totalChunks := int((size + sliceSize - 1) / sliceSize)
+	errs := make(chan error, 1)
+	var wg sync.WaitGroup
+	var err error
+
+	remaining := size
+	position := int64(0)
+
+outer:
 	for i := range totalChunks {
+		// Check any errors
+		select {
+		case err = <-errs:
+			break outer
+		default:
+		}
+
 		chunkSize := sliceSize
 		if i == totalChunks-1 {
 			// Last chunk might be smaller
@@ -856,28 +880,59 @@ func (f *Fs) uploadChunks(ctx context.Context, reader io.Reader, size int64, cre
 
 		// Read chunk data
 		chunk := make([]byte, chunkSize)
-		n, err := io.ReadFull(reader, chunk)
-		if err != nil && err != io.ErrUnexpectedEOF {
-			return fmt.Errorf("failed to read chunk %d: %w", i+1, err)
+		n, readErr := io.ReadFull(reader, chunk)
+		if readErr != nil && readErr != io.ErrUnexpectedEOF {
+			err = fmt.Errorf("failed to read chunk %d: %w", i+1, readErr)
+			break outer
 		}
 		chunk = chunk[:n]
 
-		// Calculate chunk MD5
-		hasher := md5.New()
-		hasher.Write(chunk)
-		chunkMD5 := hex.EncodeToString(hasher.Sum(nil))
+		// Transfer the chunk in parallel
+		wg.Add(1)
+		f.uploadToken.Get()
+		go func(chunkIndex int, chunkData []byte) {
+			defer wg.Done()
+			defer f.uploadToken.Put()
 
-		err = f.uploadChunk(ctx, uploadServer, createResp.PreUploadId, int(i+1), chunkMD5, chunk)
-		if err != nil {
-			return fmt.Errorf("failed to upload chunk %d: %w", i+1, err)
+			// Calculate chunk MD5
+			hasher := md5.New()
+			hasher.Write(chunkData)
+			chunkMD5 := hex.EncodeToString(hasher.Sum(nil))
+
+			fs.Debugf(f, "Uploading chunk %d/%d (size: %d bytes)", chunkIndex+1, totalChunks, len(chunkData))
+			err := f.uploadChunk(ctx, uploadServer, createResp.PreUploadId, chunkIndex+1, chunkMD5, chunkData, wrap)
+			if err != nil {
+				err = fmt.Errorf("failed to upload chunk %d: %w", chunkIndex+1, err)
+				select {
+				case errs <- err:
+				default:
+				}
+				return
+			}
+		}(i, chunk)
+
+		// ready for next block
+		remaining -= chunkSize
+		position += chunkSize
+	}
+
+	wg.Wait()
+	if err == nil {
+		// Check if there were any errors from goroutines
+		select {
+		case err = <-errs:
+		default:
 		}
+	}
+	if err != nil {
+		return err
 	}
 
 	return nil
 }
 
 // uploadChunk uploads a single chunk
-func (f *Fs) uploadChunk(ctx context.Context, server, preuploadID string, sliceNo int, sliceMD5 string, chunk []byte) error {
+func (f *Fs) uploadChunk(ctx context.Context, server, preuploadID string, sliceNo int, sliceMD5 string, chunk []byte, wrap accounting.WrapFn) error {
 	// Create multipart form data
 	formData := url.Values{}
 	formData.Set("preuploadID", preuploadID)
@@ -895,16 +950,40 @@ func (f *Fs) uploadChunk(ctx context.Context, server, preuploadID string, sliceN
 		Method:        apiUploadSlice.method,
 		RootURL:       server,
 		Path:          apiUploadSlice.uri,
-		Body:          formReader,
+		Body:          wrap(formReader),
 		ContentType:   contentType,
 		ContentLength: &contentLength,
 	}
 
 	resp := api.Response[api.NullResponse]{}
+
 	_ = apiUploadSlice.limiter.Wait(ctx)
 	_, err = f.srv.CallJSON(ctx, &opts, nil, &resp)
 	if err != nil {
 		return err
+	}
+
+	// Retry logic similar to single upload
+	retries := 0
+	for resp.Code == 1 && retries < maxRetries {
+		fs.Debugf(f, "Upload chunk server internal error, retrying... (attempt %d/%d)", retries+1, maxRetries)
+
+		// Recreate the form reader since it may have been consumed
+		formReader, contentType, overhead, err = rest.MultipartUpload(ctx, bytes.NewReader(chunk), formData, "slice", "chunk")
+		if err != nil {
+			return fmt.Errorf("failed to recreate multipart upload for retry: %w", err)
+		}
+		contentLength = overhead + int64(len(chunk))
+		opts.Body = wrap(formReader)
+		opts.ContentType = contentType
+		opts.ContentLength = &contentLength
+
+		_ = apiUploadSlice.limiter.Wait(ctx)
+		_, err = f.srv.CallJSON(ctx, &opts, nil, &resp)
+		if err != nil {
+			return err
+		}
+		retries++
 	}
 
 	if resp.Code != 0 {
