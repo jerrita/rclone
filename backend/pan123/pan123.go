@@ -516,27 +516,52 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	f.dirCache = dircache.New(root, toString(rootId), f)
 	err = f.dirCache.FindRoot(ctx, false)
 	if err != nil {
-		// Assume it is a file
-		newRoot, _ := dircache.SplitPath(root)
-		tempF := *f
-		tempF.dirCache = dircache.New(newRoot, toString(rootId), &tempF)
-		tempF.root = newRoot
-		// Make new Fs which is the parent
-		err = tempF.dirCache.FindRoot(ctx, false)
-		if err != nil {
-			// No root so return old f
+		// Check if any part of the path exists as a file instead of directory
+		newRoot, leaf := dircache.SplitPath(root)
+		if newRoot == "" {
+			// Root path doesn't exist, this is okay for new directories
 			return f, nil
 		}
 
-		f.features.Fill(ctx, &tempF)
-		// XXX: update the old f here instead of returning tempF, since
-		// `features` were already filled with functions having *f as a receiver.
-		// See https://github.com/rclone/rclone/issues/2182
-		f.dirCache = tempF.dirCache
-		f.root = tempF.root
+		tempF := *f
+		tempF.dirCache = dircache.New(newRoot, toString(rootId), &tempF)
+		tempF.root = newRoot
 
-		// return an error with a fs which points to the parent
-		return f, fs.ErrorIsFile
+		// Check if parent directory exists
+		err = tempF.dirCache.FindRoot(ctx, false)
+		if err != nil {
+			// Parent doesn't exist either, return original f for mkdir to handle
+			return f, nil
+		}
+
+		// Parent exists, get the parent directory ID and check if the leaf exists as a file
+		parentDirID, err := tempF.dirCache.RootID(ctx, false)
+		if err != nil {
+			return f, nil
+		}
+
+		// Check if there's already a file or directory with this name
+		files, err := tempF.listAll(ctx, toId(parentDirID))
+		if err != nil {
+			return f, nil
+		}
+
+		for _, file := range files {
+			if strings.EqualFold(file.FileName, leaf) {
+				if file.Type == api.TypeFile {
+					// There's already a file with this name in the parent directory
+					f.features.Fill(ctx, &tempF)
+					f.dirCache = tempF.dirCache
+					f.root = tempF.root
+					return f, fs.ErrorIsFile
+				}
+				// Directory already exists, that's fine
+				break
+			}
+		}
+
+		// Path doesn't exist, which is fine for mkdir operations
+		return f, nil
 	}
 
 	return f, nil
